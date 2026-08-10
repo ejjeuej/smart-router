@@ -1,0 +1,4 @@
+name: smart-router
+version: "0.1.0"
+description: 动态模型路由——根据任务复杂度自动切换模型以降低 token 消耗
+

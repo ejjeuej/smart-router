@@ -1,0 +1,118 @@
+{
+  "stats": {
+    "glm-5.1": {
+      "overall": {
+        "pulls": 9.361467937379716,
+        "total_reward": 1.0007976832904026,
+        "total_tokens": 123095.71971773394
+      },
+      "analysis": {
+        "pulls": 4.997028073588912,
+        "total_reward": 0.004997028073588914,
+        "total_tokens": 77019.36386775601
+      },
+      "writing": {
+        "pulls": 1.6378933674505733,
+        "total_reward": 0.0016378933674505735,
+        "total_tokens": 24627.20952268281
+      },
+      "coding": {
+        "pulls": 0.7397003733882802,
+        "total_reward": 0.0007397003733882801,
+        "total_tokens": 11514.915712535358
+      }
+    },
+    "deepseek-v3.2": {
+      "overall": {
+        "pulls": 8.441445663843947,
+        "total_reward": 0.9998776610168665,
+        "total_tokens": 112631.45987342279
+      },
+      "writing": {
+        "pulls": 1.5290301132109685,
+        "total_reward": 0.0015290301132109684,
+        "total_tokens": 24062.435181989327
+      },
+      "analysis": {
+        "pulls": 4.082626234297099,
+        "total_reward": 0.0040826262342971,
+        "total_tokens": 64767.53560231471
+      },
+      "coding": {
+        "pulls": 0.8429431933839266,
+        "total_reward": 0.0008429431933839266,
+        "total_tokens": 13867.258474358981
+      }
+    },
+    "qwen3-235b-a22b": {
+      "overall": {
+        "pulls": 8.47883283651309,
+        "total_reward": 0.9999150481895357,
+        "total_tokens": 112873.59150977171
+      },
+      "coding": {
+        "pulls": 1.5621139207764125,
+        "total_reward": 0.0015621139207764125,
+        "total_tokens": 24920.00437300052
+      },
+      "analysis": {
+        "pulls": 4.197569423130332,
+        "total_reward": 0.004197569423130331,
+        "total_tokens": 66277.60429297281
+      },
+      "writing": {
+        "pulls": 0.7323033696543974,
+        "total_reward": 0.0007323033696543973,
+        "total_tokens": 11741.752229038606
+      }
+    },
+    "qwen3.5-plus": {
+      "overall": {
+        "pulls": 8.531815826149446,
+        "total_reward": 0.9999680311791721,
+        "total_tokens": 112881.71093724406
+      },
+      "analysis": {
+        "pulls": 4.101559539048574,
+        "total_reward": 0.004101559539048574,
+        "total_tokens": 64837.33225997029
+      },
+      "coding": {
+        "pulls": 1.6497958805052648,
+        "total_reward": 0.001649795880505265,
+        "total_tokens": 25730.55885195662
+      },
+      "writing": {
+        "pulls": 0.7936142836436553,
+        "total_reward": 0.0007936142836436553,
+        "total_tokens": 12379.589210557377
+      }
+    },
+    "deepseek-v3": {
+      "overall": {
+        "pulls": 9.55474629345916,
+        "total_reward": 1.0009909616464814,
+        "total_tokens": 130612.61941695314
+      },
+      "analysis": {
+        "pulls": 5.0075505185628755,
+        "total_reward": 0.005007550518562876,
+        "total_tokens": 80186.68644786079
+      },
+      "coding": {
+        "pulls": 1.7424427143471035,
+        "total_reward": 0.0017424427143471035,
+        "total_tokens": 27760.16296369412
+      },
+      "writing": {
+        "pulls": 0.8179069375972307,
+        "total_reward": 0.0008179069375972306,
+        "total_tokens": 12731.539390638492
+      }
+    }
+  },
+  "total_rounds": 42,
+  "c": 0.05,
+  "alpha": 0.012,
+  "base_reward": 100.0
+}
