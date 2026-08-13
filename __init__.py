@@ -122,6 +122,34 @@ def _safe_pass_through(request, next_call):
     return next_call(request)
 
 
+def _annotate_response(response, cfg, model_routed, complexity, task_type,
+                       method, latency_ms, pool_key):
+    """在回复末尾追加路由脚注，让用户在对话界面直接看到路由结果。
+
+    开关：config.yaml smart_model_routing.announce（默认 true）。
+    仅注入有文本内容的成功响应；tool 续调/无文本响应不注入。
+    任何异常静默跳过（print stderr），绝不影响路由主流程。
+    """
+    try:
+        if not cfg.get("announce", True):
+            return response
+        if not (response and getattr(response, "choices", None)):
+            return response
+        msg = response.choices[0].message
+        content = getattr(msg, "content", None)
+        if not content:
+            return response  # 纯 tool_calls 等无文本响应，不注入
+        actual = getattr(response, "model", None) or model_routed
+        tier = "complex" if pool_key == "complex_models" else "simple"
+        note = (f"\n\n────\n[smart-router] 已路由至 {actual}"
+                f" · {tier}/{task_type} · {method} · {latency_ms}ms")
+        msg.content = content + note
+    except Exception as e:
+        print(f"[smart-router] annotate response failed: {e}",
+              file=sys.stderr)
+    return response
+
+
 def on_llm_execution(request, next_call, **context):
     global _last_routed
     cfg = load_router_config()
@@ -290,7 +318,9 @@ def on_llm_execution(request, next_call, **context):
                     _last_routed = {"model": selected["model"],
                                     "base_url": selected["base_url"],
                                     "api_key": selected["api_key"]}
-                    return response
+                    return _annotate_response(
+                        response, cfg, selected["model"], complexity,
+                        task_type, method, latency_ms, pool_key)
 
                 except Exception as e:
                     err_str = str(e)
@@ -370,7 +400,9 @@ def on_llm_execution(request, next_call, **context):
 
             _last_routed = {"model": c["model"], "base_url": c["base_url"],
                             "api_key": c["api_key"]}
-            return response
+            return _annotate_response(
+                response, cfg, c["model"], complexity,
+                task_type, method, latency_ms, pool_key)
         except Exception as e:
             err_str = str(e)
             print(f"[smart-router] {c['model']} failed: {e}", file=sys.stderr)

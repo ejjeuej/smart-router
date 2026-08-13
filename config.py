@@ -343,6 +343,7 @@ def _discover_provider_models(data: dict) -> dict:
 _BOOTSTRAP_TEXT = (
     "\nsmart_model_routing:\n"
     "  enabled: true\n"
+    "  announce: true\n"
     "  bandit:\n"
     "    enabled: true\n"
     "    ucb_c: 1.0\n"
