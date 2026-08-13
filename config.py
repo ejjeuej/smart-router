@@ -130,7 +130,30 @@ def classify_model(name: str) -> str:
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    """解析 Hermes home 目录（多级探测，兼容桌面打包版）。
+
+    解析顺序：
+      1. HERMES_HOME 环境变量（Hermes 主程序显式指定，profile/自定义部署）
+      2. Windows 桌面打包版：%LOCALAPPDATA%\\hermes
+         Sinoregal Agent 打包版把平台默认 home 放在这里，且**不设置**
+         HERMES_HOME 环境变量（主程序内部默认路径已被改掉，但插件是
+         独立代码看不到），只能靠探测：该目录存在即视为 home。
+         这也是 .env / config.yaml / plugins 实际所在的位置。
+      3. 原版默认 ~/.hermes（NousResearch hermes / POSIX 部署）
+    """
+    env = os.environ.get("HERMES_HOME", "").strip()
+    if env:
+        return Path(env)
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        if local:
+            candidate = Path(local) / "hermes"
+            try:
+                if candidate.is_dir():
+                    return candidate
+            except OSError:
+                pass
+    return Path.home() / ".hermes"
 
 
 def _config_path() -> Path:
