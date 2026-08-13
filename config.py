@@ -339,6 +339,46 @@ def _discover_provider_models(data: dict) -> dict:
     return discovered
 
 
+# ── 自举默认配置（config.yaml 缺段时写入，装上即用）────────────────────
+_BOOTSTRAP_TEXT = (
+    "\nsmart_model_routing:\n"
+    "  enabled: true\n"
+    "  bandit:\n"
+    "    enabled: true\n"
+    "    ucb_c: 1.0\n"
+    "    alpha: 0.012\n"
+    "    base_reward: 100.0\n"
+)
+
+
+def _bootstrap_router_config() -> None:
+    """config.yaml 顶层缺少 smart_model_routing 段时，追加默认配置。
+
+    只在段完全不存在时写入；段存在（含 enabled:false）一律不动，
+    保证用户显式关闭的选择不被覆盖。文本追加而非 yaml 重写，
+    保留原文件注释与格式。失败仅告警，不抛错、不影响放行路径。
+    """
+    try:
+        import yaml
+        path = _config_path()
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        try:
+            top = yaml.safe_load(text or "{}") or {}
+        except Exception:
+            top = {}
+        if "smart_model_routing" in top:
+            return  # 已存在（重入/并发保护）
+        if text and not text.endswith("\n"):
+            text += "\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text + _BOOTSTRAP_TEXT)
+        print("[smart-router] config.yaml 缺少 smart_model_routing 段，"
+              "已写入默认配置（enabled: true）", file=sys.stderr)
+    except Exception as e:
+        print(f"[smart-router] 自举写入默认配置失败: {e}", file=sys.stderr)
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────────
 def load_router_config(force: bool = False) -> dict:
     """加载 smart_model_routing 配置，自动发现模型并构建路由池。
@@ -360,8 +400,16 @@ def load_router_config(force: bool = False) -> dict:
     cfg = data.get("smart_model_routing", {}) or {}
 
     if not force and (not cfg or not cfg.get("enabled")):
-        _ROUTER_CACHE, _ROUTER_CACHE_KEY = {}, cache_key
-        return {}
+        # ── 自举：config.yaml 完全没有 smart_model_routing 段时写入默认配置 ──
+        # 段存在但 enabled=false 视为用户主动关闭，绝不改写。
+        # 写入后重读（mtime 已变，缓存自然失效），仍不可用才放行。
+        if "smart_model_routing" not in data:
+            _bootstrap_router_config()
+            data = _load_yaml()
+            cfg = data.get("smart_model_routing", {}) or {}
+        if not cfg or not cfg.get("enabled"):
+            _ROUTER_CACHE, _ROUTER_CACHE_KEY = {}, cache_key
+            return {}
 
     # 发现 + 过滤 + 分类
     discovered = _discover_provider_models(data)
