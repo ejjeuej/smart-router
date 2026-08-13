@@ -1,0 +1,25 @@
+# Python 编译缓存
+__pycache__/
+*.pyc
+
+# 运行时数据（路由日志、bandit 状态），不进入版本库
+data/
+
+# 日志
+*.log
+debug.log
+
+# 本地对比/补丁记录（不属于插件本体）
+comparison.txt
+CORE_CHANGES.md
+
+# 无关实验目录
+sorting-algorithms-comparison/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境与密钥
+.env
+*.env

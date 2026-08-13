@@ -364,7 +364,7 @@ def save_all():
                 tmp = str(path) + ".tmp"
                 with open(tmp, "w") as f:
                     json.dump(bandit.to_dict(), f, indent=2)
-                Path(tmp).rename(path)
+                Path(tmp).replace(path)
             except Exception:
                 pass
 
@@ -380,6 +380,6 @@ def save_one(pool_key):
         tmp = str(path) + ".tmp"
         with open(tmp, "w") as f:
             json.dump(_bandits[pool_key].to_dict(), f, indent=2)
-        Path(tmp).rename(path)
+        Path(tmp).replace(path)
     except Exception:
         pass

@@ -127,14 +127,6 @@ def classify_model(name: str) -> str:
     # 6) 默认 simple
     return "simple"
 
-# ── 硬编码兜底端点：用户只在 .env 设了 key、config 里没配 provider ──────
-_KNOWN_ENDPOINTS = (
-    ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
-    ("https://api.moonshot.cn/v1", "KIMI_CN_API_KEY"),
-    ("https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY"),
-    ("https://api.openai.com/v1", "OPENAI_API_KEY"),
-)
-
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 def _hermes_home() -> Path:
@@ -247,7 +239,13 @@ def _iter_custom_providers(data: dict):
 
 
 def _scan_provider_plugins(add_model) -> None:
-    """扫描 Hermes provider 注册表。打包环境 import 失败时静默跳过。"""
+    """扫描 Hermes provider 注册表。打包环境 import 失败时静默跳过。
+
+    对每个有 base_url + 已配 key 的 OpenAI 兼容 provider：
+    优先用 fallback_models / fetch_models；都没有则主动调 /models 拉取。
+    """
+    # 非 OpenAI 兼容的 api_mode —— 调 /models 会失败或格式不对，直接跳过
+    _SKIP_API_MODES = {"anthropic_messages", "bedrock_converse", "codex_responses", "copilot_acp"}
     try:
         from providers import list_providers
         profiles = list_providers()
@@ -255,7 +253,10 @@ def _scan_provider_plugins(add_model) -> None:
         return
     for prof in profiles:
         base = getattr(prof, "base_url", "") or ""
-        if not base:
+        if not base or not base.startswith("http"):
+            continue
+        api_mode = getattr(prof, "api_mode", "") or ""
+        if api_mode in _SKIP_API_MODES:
             continue
         for env in (getattr(prof, "env_vars", ()) or ()):
             key = get_api_key(env)
@@ -271,6 +272,9 @@ def _scan_provider_plugins(add_model) -> None:
                 for m in fetched:
                     if m not in models:
                         models.append(m)
+            # ★ 兜底：fallback_models 和 fetch_models 都没出模型时，主动调 /models
+            if not models:
+                models = _fetch_models(base, key)
             for m in models:
                 add_model(m, base, key)
             break  # 一个 provider 取一个已配 key 即可
@@ -309,13 +313,6 @@ def _discover_provider_models(data: dict) -> dict:
     # 来源二：Hermes provider 注册表（app 里配的标准 provider）
     _scan_provider_plugins(add_model)
 
-    # 来源三：硬编码兜底（只设了 .env key、没配任何 provider）
-    for base_url, env in _KNOWN_ENDPOINTS:
-        key = get_api_key(env)
-        if key:
-            for m in _fetch_models(base_url, key):
-                add_model(m, base_url, key)
-
     return discovered
 
 
@@ -351,6 +348,20 @@ def load_router_config(force: bool = False) -> dict:
         if not _is_chat_model(m):
             continue
         (simple if classify_model(m) == "simple" else complex_).add(m)
+
+    # ── 白名单收窄：config 显式指定 simple_models/complex_models 时只保留它们 ──
+    # 任一列表非空即视为“收窄模式”：路由池限定为这两个列表的并集，
+    # 且按列表归属重新分池（覆盖自动分类结果）。
+    # 未发现可用 endpoint 的模型会被忽略并告警。
+    explicit_simple = [m for m in (cfg.get("simple_models") or []) if isinstance(m, str)]
+    explicit_complex = [m for m in (cfg.get("complex_models") or []) if isinstance(m, str)]
+    if explicit_simple or explicit_complex:
+        simple = {m for m in explicit_simple if m in discovered}
+        complex_ = {m for m in explicit_complex if m in discovered}
+        missing = (set(explicit_simple) | set(explicit_complex)) - simple - complex_
+        if missing:
+            print(f"[smart-router] 白名单收窄：以下模型未发现可用 endpoint，已忽略: "
+                  f"{sorted(missing)}", file=sys.stderr)
 
     providers = {}
     for m in simple | complex_:

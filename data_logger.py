@@ -31,6 +31,7 @@ def log_classification(
     latency_ms=0,
     model_routed_to=None,
     routing_success=None,
+    model_actual=None,
 ):
     """
     追加一条分类记录。
@@ -44,6 +45,7 @@ def log_classification(
     latency_ms:    分类耗时（毫秒）
     model_routed_to:  最终路由到的模型名，可为 None
     routing_success:  路由调用是否成功，可为 None
+    model_actual:    服务商实际回执的模型名（response.model），可为 None
     """
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -56,6 +58,7 @@ def log_classification(
         "latency_ms": latency_ms,
         "model_routed_to": model_routed_to,
         "routing_success": routing_success,
+        "model_actual": model_actual,
     }
 
     data_dir = _get_data_dir()

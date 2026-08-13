@@ -283,6 +283,7 @@ def on_llm_execution(request, next_call, **context):
                         method=result["method"],
                         latency_ms=latency_ms,
                         model_routed_to=selected["model"],
+                        model_actual=getattr(response, "model", selected["model"]),
                         routing_success=True,
                     )
 
@@ -363,6 +364,7 @@ def on_llm_execution(request, next_call, **context):
                 method=result["method"],
                 latency_ms=latency_ms,
                 model_routed_to=c["model"],
+                model_actual=getattr(response, "model", c["model"]),
                 routing_success=True,
             )
 
