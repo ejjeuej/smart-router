@@ -319,6 +319,12 @@ def get_bandit(pool_key, bandit_config=None):
             base_reward=cfg.get("base_reward", 100.0),
         )
         _load(pool_key)
+        # 关键修复：_load 会用 JSON 里持久化的 c/alpha/base_reward 覆盖 config，
+        # 导致改 config.yaml 的 ucb_c 不生效。这里强制用 config 的值覆盖回来。
+        b = _bandits[pool_key]
+        b.c = float(cfg.get("ucb_c", 2.0))
+        b.alpha = float(cfg.get("alpha", 0.00001))
+        b.base_reward = float(cfg.get("base_reward", 100.0))
     return _bandits[pool_key]
 
 

@@ -2,15 +2,15 @@
 Intent classification + routing engine — local heuristics with session-state tracking.
 
 Architecture:
-  1. ConversationState — tracks per-session complexity score with exponential decay
+  1. ConversationState — 布尔 last_turn_complex 记录上一轮是否 complex
   2. extract_features() — pure regex, <1ms
   3. route() — 4-layer decision engine, LLM only as last resort (~20% traffic)
   4. classify() — public API (backward-compatible with existing callers)
 
 Key insight: classification input was missing context. "解释一下" in a complex
 coding session should route to complex models, but any single-message classifier
-sees just 4 chars and defaults to simple.  The complexity_score c ∈ [0,1] carries
-the implicit context that was missing.
+sees just 4 chars and defaults to simple.  布尔 last_turn_complex + 短跟帖词表
+carries the implicit context, without the inconsistency of a decaying score.
 """
 
 import re
@@ -26,18 +26,12 @@ from typing import List
 
 @dataclass
 class ConversationState:
-    complexity_score: float = 0.0       # 0=simple, 1=complex
+    last_turn_complex: bool = False   # 上一轮是否路由到 complex（布尔，非衰减分）
     last_model_tier: str = "simple"
-    turns_since_complex: int = 999
     recent_topics: List[str] = field(default_factory=list)
 
     def update_after_turn(self, routed_tier: str, topic: str = ""):
-        if routed_tier == "complex":
-            self.complexity_score = 1.0
-            self.turns_since_complex = 0
-        else:
-            self.complexity_score *= 0.85   # exponential decay
-            self.turns_since_complex += 1
+        self.last_turn_complex = (routed_tier == "complex")
         self.last_model_tier = routed_tier
         if topic:
             self.recent_topics.append(topic)
@@ -122,6 +116,18 @@ TYPE_WEIGHTS = {
     "factual": 0.2,
 }
 
+# 短跟帖词表：上一轮 complex 时，含这些词的短句视为「延续上下文」而非新问题
+# （"解释一下" / "继续" / "为什么"…）。配合布尔 last_turn_complex，替代原来的
+# 衰减分数——不会再把"你是谁""hi"这类新问题误判成 complex。
+FOLLOWUP_PATTERNS = (
+    "解释", "继续", "详细", "展开", "具体", "然后", "为什么",
+    "什么意思", "举例", "接着",
+)
+
+
+def _is_followup(message: str) -> bool:
+    return any(p in message for p in FOLLOWUP_PATTERNS)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 4-layer routing engine
@@ -131,20 +137,20 @@ def route(message: str, state: ConversationState) -> str:
     """Return "simple" or "complex" — the model tier to use.
 
     Layers:
-      R1: context inheritance — "解释一下" in a complex session → complex
+      R0: context inheritance — 短跟帖词 + 上一轮 complex → complex
       R2: explicit complex signals — code, math, long messages → complex
-      R3: type weight × session state fusion — score-based threshold
-      R4: LLM fallback — only ~20% of traffic reaches here
+      R3: type weight — score-based threshold
+      R4: LLM fallback — 灰区才到这里
     """
     f = extract_features(message)
 
-    # R1: context inheritance — the core rule that fixes "解释一下"
+    # R0: 上下文继承（布尔 last_turn_complex + 短跟帖词表）
     #
-    # If the message is a reference ("那个" / "刚才的") or an ellipsis
-    # ("解释一下", 4 chars), AND the session has been complex → route to complex.
-    # The complexity_score carries implicit context that a single-message
-    # classifier can never see.
-    if (f["has_reference"] or f["is_ellipsis"]) and state.complexity_score > 0.5:
+    # 上一轮是 complex，且本句是「引用上一轮」（"那个"/"它"）或短跟帖
+    # （"解释一下"/"继续"/"为什么"…）→ 延续 complex。
+    # 布尔信号替代原来的衰减分数：同一条消息在任何 session 状态下结果一致，
+    # 不会把"你是谁""hi"这类新问题误判成 complex。
+    if state.last_turn_complex and (f["has_reference"] or _is_followup(message)):
         return "complex"
 
     # R2: explicit complex signals — no LLM needed
@@ -157,17 +163,11 @@ def route(message: str, state: ConversationState) -> str:
     if not f["type_matched"] and 10 < f["length"] <= 200:
         return "llm"
 
-    # R3: type weight × session state fusion
-    #
-    # score = max(type_weight, complexity_score × 0.5)
-    # The max() ensures that even in a complex session, a factual question
-    # (weight 0.2) gets max(0.2, 0.425) = 0.425 → falls into the R4 grey zone,
-    # rather than being hard-routed to complex.
+    # R3: 类型权重评分（去掉 complexity_score 融合，结果只依赖当前消息）
     type_weight = TYPE_WEIGHTS.get(f["question_type"], 0.3)
-    score = max(type_weight, state.complexity_score * 0.5)
-    if score > 0.6:
+    if type_weight > 0.6:
         return "complex"
-    elif score < 0.3:
+    elif type_weight < 0.3:
         return "simple"
 
     # R4: grey zone → LLM fallback (only ~20% of traffic)
@@ -178,56 +178,67 @@ def route(message: str, state: ConversationState) -> str:
 # LLM fallback — only called for ~20% of requests in the grey zone
 # ═══════════════════════════════════════════════════════════════════════════
 
+# 分类模型黑名单（进程级）：分类调用失败的模型不再重试，重启后重置
+_CLASSIFIER_BROKEN = set()
+
+
 def _llm_classify_fast(message: str, state: ConversationState,
                        classifier_cfg=None) -> dict:
-    """Lightweight LLM classification for grey-zone requests.
+    """轻量 LLM 分类，用于灰区请求。
 
-    Returns {"tier": "simple"|"complex", "task_type": "..."}.
-    task_type is one of: chat, coding, reasoning, writing, analysis, translation, other.
+    classifier_cfg 可为单个 dict 或 list of dict（按顺序 fallback，
+    轻量模型优先，失败的自动切下一个）。全部失败时兜底返回 simple/other。
     """
     if not classifier_cfg:
         return {"tier": "simple", "task_type": "other"}
+    cfgs = [classifier_cfg] if isinstance(classifier_cfg, dict) else list(classifier_cfg)
 
-    try:
-        from openai import OpenAI
+    recent = state.recent_topics[-2:] if state.recent_topics else []
+    recent_str = ", ".join(recent) if recent else "(none)"
+    prompt = (
+        f"Recent topics: [{recent_str}]\n"
+        f"Message: {message}\n\n"
+        f'Reply with ONLY JSON — no other text:\n'
+        f'{{"tier":"simple|complex","task_type":"chat|coding|reasoning|writing|analysis|translation|other"}}'
+    )
 
-        recent = state.recent_topics[-2:] if state.recent_topics else []
-        recent_str = ", ".join(recent) if recent else "(none)"
+    for cfg in cfgs:
+        model = cfg.get("model", "")
+        if model in _CLASSIFIER_BROKEN:
+            continue
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"],
+                            timeout=6.0, max_retries=0)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=30,
+                temperature=0,
+            )
+            raw = response.choices[0].message.content.strip()
 
-        prompt = (
-            f"Recent topics: [{recent_str}]\n"
-            f"Message: {message}\n\n"
-            f'Reply with ONLY JSON — no other text:\n'
-            f'{{"tier":"simple|complex","task_type":"chat|coding|reasoning|writing|analysis|translation|other"}}'
-        )
+            # Parse JSON
+            import json
+            # Strip markdown fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+            result = json.loads(raw)
+            return {
+                "tier": result.get("tier", "simple"),
+                "task_type": result.get("task_type", "other"),
+            }
+        except Exception as e:
+            _CLASSIFIER_BROKEN.add(model)
+            print(f"[smart-router] classifier {model} failed, switching: "
+                  f"{str(e)[:80]}", file=sys.stderr)
+            continue
 
-        client = OpenAI(
-            base_url=classifier_cfg["base_url"],
-            api_key=classifier_cfg["api_key"],
-        )
-        response = client.chat.completions.create(
-            model=classifier_cfg["model"],
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=30,
-            temperature=0,
-        )
-        raw = response.choices[0].message.content.strip()
-
-        # Parse JSON
-        import json
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-        result = json.loads(raw)
-        return {
-            "tier": result.get("tier", "simple"),
-            "task_type": result.get("task_type", "other"),
-        }
-    except Exception as e:
-        print(f"[smart-router] LLM fallback failed: {e}", file=sys.stderr)
-        return {"tier": "simple", "task_type": "other"}
+    print("[smart-router] all classifier models failed, fallback to simple/other",
+          file=sys.stderr)
+    return {"tier": "simple", "task_type": "other"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
