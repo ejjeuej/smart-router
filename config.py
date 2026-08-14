@@ -45,21 +45,35 @@ _NON_CHAT_KEYWORDS = (
 #   6) 默认 simple（宁可强模型干简单活，不让弱模型干复杂推理）
 
 _EXACT_TIER = {
-    "deepseek-chat": "complex",      # v3 通用大模型别名
-    "deepseek-reasoner": "complex",  # 推理
+    # ── DeepSeek（命名规则的通用大模型，精确避免歧义）──
+    "deepseek-chat": "complex",       # v3 通用大模型别名
+    "deepseek-reasoner": "complex",   # 推理
     "deepseek-v3": "complex",
     "deepseek-v3.1": "complex",
     "deepseek-v3.2": "complex",
+    # ── OpenAI（旗舰与轻量命名易冲突，精确锁定）──
     "gpt-4o-mini": "simple",
     "gpt-4o": "complex",
+    "gpt-4-turbo": "complex",         # 旗舰，避免被 turbo 关键词误降为 simple
+    "gpt-oss-20b": "simple",          # 小杯，无规格关键词，需精确
+    "gpt-oss-120b": "complex",
+    # ── Moonshot（按上下文窗口分级）──
     "moonshot-v1-8k": "simple",
     "moonshot-v1-32k": "complex",
     "moonshot-v1-128k": "complex",
+    # ── 与 turbo 关键词冲突的旗舰（精确覆盖，避免误降）──
+    "hunyuan-turbo": "complex",
+    # ── 无参数量后缀、无家族前缀可兜底的旗舰 ──
+    "llama-4-maverick": "complex",
+    "llama-4-behemoth": "complex",
+    "mistral-medium": "complex",
+    "internlm3": "complex",
 }
 
 _SPEC_SIMPLE = (
     "distill", "flash", "lite", "air", "nano", "turbo", "tiny",
     "small", "-mini", "haiku",
+    "lightning", "speed", "standard", "scout",
 )
 _SPEC_COMPLEX = (
     "thinking", "reasoner", "max", "pro", "plus", "ultra", "premium",
@@ -67,25 +81,80 @@ _SPEC_COMPLEX = (
 )
 
 _FAMILY_TIER = (
+    # ── DeepSeek ──
     ("deepseek-r1", "complex"),
     ("deepseek-v3", "complex"),
     ("deepseek-v4", "complex"),
-    ("qwq", "complex"),
-    ("qvq", "complex"),
-    ("kimi", "complex"),
-    ("moonshot", "complex"),
-    ("minimax", "complex"),
-    ("glm-4", "complex"),
-    ("glm-5", "complex"),
-    ("doubao-seed", "complex"),
+    ("deepseek", "complex"),          # 统一兜底（chat 等已精确）
+    # ── OpenAI ──
+    ("gpt-3.5", "simple"),            # 旧模型，轻量
+    ("gpt-4", "complex"),
+    ("gpt-5", "complex"),
+    ("gpt-oss", "complex"),           # 兜底，20b 已精确 simple
+    ("o1", "complex"),
+    ("o3", "complex"),
+    ("o4", "complex"),
+    ("chatgpt", "complex"),           # chatgpt-4o-latest
+    # ── Anthropic ──
+    ("claude", "complex"),            # haiku 靠关键词降 simple
+    # ── Google ──
+    ("gemini", "complex"),            # flash 靠关键词降 simple
+    ("gemma", "simple"),              # 开源轻量
+    # ── xAI ──
+    ("grok", "complex"),              # mini 靠关键词降 simple
+    # ── Mistral 系（分品牌，不加整族以保留参数量兜底）──
+    ("codestral", "complex"),
+    ("pixtral", "complex"),
+    ("ministral", "simple"),
+    # ── 通义千问（仅精确族；版本号靠参数量兜底，避免 qwen-7b 被误升）──
     ("qwen-coder", "complex"),
     ("qwen3-coder", "complex"),
     ("qwen-math", "complex"),
     ("qwen-long", "complex"),
-    ("gpt-4", "complex"),
-    ("gpt-5", "complex"),
-    ("claude", "complex"),
+    ("qwq", "complex"),
+    ("qvq", "complex"),
+    # ── Kimi / Moonshot ──
+    ("kimi", "complex"),
+    ("moonshot", "complex"),
+    # ── 智谱 GLM ──
+    ("glm-4", "complex"),
+    ("glm-5", "complex"),
+    ("glm", "complex"),               # 兜底 glm-z1 / glm-3
     ("zhipu", "complex"),
+    # ── 豆包 / 字节 ──
+    ("doubao-seed", "complex"),
+    ("doubao", "complex"),            # pro/lite/flash/standard 靠关键词
+    # ── MiniMax ──
+    ("minimax", "complex"),
+    ("abab", "complex"),
+    # ── 百度文心 ──
+    ("ernie", "complex"),             # speed/lite/turbo 靠关键词降 simple
+    ("wenxin", "complex"),
+    # ── 腾讯混元 ──
+    ("hunyuan", "complex"),           # lite/standard 靠关键词，turbo 已精确
+    # ── 讯飞星火 ──
+    ("spark", "complex"),             # lite 靠关键词
+    # ── 阶跃星辰 ──
+    ("step-1", "complex"),
+    ("step-2", "complex"),
+    ("step-3", "complex"),
+    # ── 零一万物（只兜 medium；large 靠关键词，lightning 靠关键词，开源走参数量）──
+    ("yi-medium", "complex"),
+    # ── 百川 ──
+    ("baichuan", "complex"),
+    # ── Cohere ──
+    ("command-r", "complex"),
+    ("command-a", "complex"),
+    # ── 书生 / 面壁 / 天工 / 盘古 / 商汤 / 小米 / Nous ──
+    ("minicpm", "simple"),            # 面壁开源小模型
+    ("skywork", "complex"),
+    ("tiangong", "complex"),
+    ("pangu", "complex"),
+    ("sensechat", "complex"),
+    ("sense-nova", "complex"),
+    ("mimo", "simple"),               # 小米 MiMo 开源轻量
+    ("hermes", "complex"),            # NousResearch hermes
+    # ── 平台/其他（原表保留）──
     ("xiaomi", "complex"),
     ("vanchin", "complex"),
     ("siliconflow", "complex"),
