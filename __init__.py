@@ -11,6 +11,7 @@ if str(_plugin_dir) not in sys.path:
 from config import load_router_config, load_default_model, get_api_key
 from classifier import classify, get_state
 from data_logger import log_classification
+from logger import debug, error, info
 
 # 记录最近一次路由成功的模型配置，用于 tool 续调
 _last_routed = None
@@ -116,8 +117,8 @@ def _safe_pass_through(request, next_call):
     if default_model and default_model != request.get("model", ""):
         fallback_request = dict(request)
         fallback_request["model"] = default_model
-        print(f"[smart-router] normalizing model: "
-              f"{request.get('model')} → {default_model}", file=sys.stderr)
+        info(f"normalizing model: "
+              f"{request.get('model')} → {default_model}")
         return next_call(fallback_request)
     return next_call(request)
 
@@ -145,8 +146,7 @@ def _annotate_response(response, cfg, model_routed, complexity, task_type,
                 f" · {tier}/{task_type} · {method} · {latency_ms}ms")
         msg.content = content + note
     except Exception as e:
-        print(f"[smart-router] annotate response failed: {e}",
-              file=sys.stderr)
+        info(f"annotate response failed: {e}")
     return response
 
 
@@ -218,12 +218,21 @@ def on_llm_execution(request, next_call, **context):
 
     method = result.get("method", "?")
     reasoning = result.get("reasoning", "?")
-    print(f"[smart-router] classify: method={method} "
-          f"→ {complexity}/{task_type} ({reasoning}) {latency_ms}ms",
-          file=sys.stderr)
+    info(f"classify: method={method} "
+          f"→ {complexity}/{task_type} ({reasoning}) {latency_ms}ms")
 
-    user_texts = [m.get("content", "") for m in request.get("messages", [])
-                  if m.get("role") == "user"]
+    user_texts = []
+    for m in request.get("messages", []):
+        if m.get("role") != "user" or not isinstance(m.get("content"), str):
+            continue
+        content = m["content"].strip()
+        if content.startswith("[System:"):
+            end = content.find("]")
+            if end == -1:
+                continue
+            content = content[end + 1:].strip()
+        if content:
+            user_texts.append(content)
     user_message = user_texts[-1] if user_texts else ""
 
     # ── 选池：task_type + complexity 联合决策 ──
@@ -290,8 +299,8 @@ def on_llm_execution(request, next_call, **context):
                     modified.pop("stream", None)
                     modified.pop("stream_options", None)
                     modified.pop("enable_thinking", None)
-                    print(f"[smart-router] bandit → {pool_key}({task_type}) → "
-                          f"{selected['model']}", file=sys.stderr)
+                    info(f"bandit → {pool_key}({task_type}) → "
+                          f"{selected['model']}")
                     response = client.chat.completions.create(**modified)
 
                     total_tokens = response.usage.total_tokens if response.usage else 0
@@ -324,27 +333,24 @@ def on_llm_execution(request, next_call, **context):
 
                 except Exception as e:
                     err_str = str(e)
-                    print(f"[smart-router] bandit {selected['model']} failed: {e}",
-                          file=sys.stderr)
+                    info(f"bandit {selected['model']} failed: {e}")
 
                     if _is_quota_exhausted(err_str):
                         exhausted_models.add(selected["model"])
                         bandit.update(selected["model"], success=False,
                                       total_tokens=0, task_type=task_type)
-                        print(f"[smart-router] quota exhausted for "
+                        info(f"quota exhausted for "
                               f"{selected['model']}, down-ranked (本轮跳过，"
-                              f"后续轮次/下次额度恢复会重试)", file=sys.stderr)
+                              f"后续轮次/下次额度恢复会重试)")
                     elif _is_permanent_broken(err_str):
                         _PERMANENT_BLACKLIST.add(selected["model"])
-                        print(f"[smart-router] {selected['model']} permanently "
-                              f"broken (404/400/access denied), blacklisted",
-                              file=sys.stderr)
+                        info(f"{selected['model']} permanently "
+                              f"broken (404/400/access denied), blacklisted")
                     elif any(s in err_str for s in
                              ("429", "500", "502", "503", "504")):
                         round_blacklist.add(selected["model"])
-                        print(f"[smart-router] server error for "
-                              f"{selected['model']}, skipping this round",
-                              file=sys.stderr)
+                        info(f"server error for "
+                              f"{selected['model']}, skipping this round")
                     else:
                         bandit.update(selected["model"], success=False,
                                       total_tokens=0, task_type=task_type)
@@ -353,12 +359,10 @@ def on_llm_execution(request, next_call, **context):
     # ── 顺序 fallback：逐个尝试未试过的候选 ──
     for c in candidates:
         if c["model"] in exhausted_models:
-            print(f"[smart-router] skipping {c['model']} — quota exhausted",
-                  file=sys.stderr)
+            info(f"skipping {c['model']} — quota exhausted")
             continue
         if c["model"] in round_blacklist:
-            print(f"[smart-router] skipping {c['model']} — server error this round",
-                  file=sys.stderr)
+            info(f"skipping {c['model']} — server error this round")
             continue
         if c["model"] in tried_models:
             continue
@@ -372,8 +376,7 @@ def on_llm_execution(request, next_call, **context):
             modified.pop("stream", None)
             modified.pop("stream_options", None)
             modified.pop("enable_thinking", None)
-            print(f"[smart-router] fallback {pool_key}({task_type}) → {c['model']}",
-                  file=sys.stderr)
+            info(f"fallback {pool_key}({task_type}) → {c['model']}")
             response = client.chat.completions.create(**modified)
 
             if use_bandit:
@@ -405,25 +408,24 @@ def on_llm_execution(request, next_call, **context):
                 task_type, method, latency_ms, pool_key)
         except Exception as e:
             err_str = str(e)
-            print(f"[smart-router] {c['model']} failed: {e}", file=sys.stderr)
+            info(f"{c['model']} failed: {e}")
 
             if _is_quota_exhausted(err_str):
                 exhausted_models.add(c["model"])
                 if use_bandit:
                     bandit.update(c["model"], success=False, total_tokens=0,
                                   task_type=task_type)
-                print(f"[smart-router] quota exhausted for {c['model']}, "
-                      f"down-ranked (本轮跳过，后续轮次/下次额度恢复会重试)",
-                      file=sys.stderr)
+                info(f"quota exhausted for {c['model']}, "
+                      f"down-ranked (本轮跳过，后续轮次/下次额度恢复会重试)")
             elif _is_permanent_broken(err_str):
                 _PERMANENT_BLACKLIST.add(c["model"])
-                print(f"[smart-router] {c['model']} permanently broken "
-                      f"(404/400/access denied), blacklisted", file=sys.stderr)
+                info(f"{c['model']} permanently broken "
+                      f"(404/400/access denied), blacklisted")
             elif any(s in err_str for s in
                      ("429", "500", "502", "503", "504")):
                 round_blacklist.add(c["model"])
-                print(f"[smart-router] server error for {c['model']}, "
-                      f"skipping this round", file=sys.stderr)
+                info(f"server error for {c['model']}, "
+                      f"skipping this round")
             else:
                 if use_bandit:
                     bandit.update(c["model"], success=False, total_tokens=0,

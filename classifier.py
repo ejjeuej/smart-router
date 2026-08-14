@@ -14,10 +14,11 @@ carries the implicit context, without the inconsistency of a decaying score.
 """
 
 import re
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import List
+
+from logger import debug, error, info
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -157,6 +158,13 @@ def route(message: str, state: ConversationState) -> str:
     if f["has_code"] or f["has_math"] or f["length"] > 200:
         return "complex"
 
+    # R2.3: 无明确类型的寒暄/致谢/极短句 → 直接 simple。
+    # 注意 type_matched 时不拦截（"代码"/"数学" 这类有类型信号的极短词
+    # 交给 R3 类型权重评分），否则 code_gen 权重 0.8 会被误降 simple。
+    if not f["type_matched"] and (
+            f["is_greeting"] or f["is_thanks"] or f["length"] <= 3):
+        return "simple"
+
     # R2.5: type not matched + non-trivial message → don't trust factual default
     # "factual" default (weight 0.2) would wrongly force simple.  Short messages
     # (≤10 chars) without keywords are likely trivial follow-ups and stay factual.
@@ -232,12 +240,10 @@ def _llm_classify_fast(message: str, state: ConversationState,
             }
         except Exception as e:
             _CLASSIFIER_BROKEN.add(model)
-            print(f"[smart-router] classifier {model} failed, switching: "
-                  f"{str(e)[:80]}", file=sys.stderr)
+            error(f"classifier {model} failed, switching: {str(e)[:80]}")
             continue
 
-    print("[smart-router] all classifier models failed, fallback to simple/other",
-          file=sys.stderr)
+    error("all classifier models failed, fallback to simple/other")
     return {"tier": "simple", "task_type": "other"}
 
 
@@ -255,17 +261,29 @@ def classify(messages, classifier_cfg=None):
         {"complexity": "simple"|"complex", "task_type": "...",
          "confidence": 0.0~1.0, "method": "rule"|"llm", "reasoning": "..."}
     """
-    # Extract last user message
+    # Extract last user message.
+    # Hermes 切换模型时会注入 role="user" 的元数据消息:
+    #   "[System: The active model ...]\n\n<真实用户内容>"
+    # 整条参与分类时长度>200,会把 "hi" 这类简单消息误判 complex。
+    # 修复:剥掉 [System: ...] 前缀块,保留后面的真实用户文本。
     user_texts = []
     for msg in messages:
         if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-            user_texts.append(msg["content"].strip())
+            content = msg["content"].strip()
+            if content.startswith("[System:"):
+                end = content.find("]")
+                if end == -1:
+                    continue  # 无闭合括号,视为纯注入,跳过
+                content = content[end + 1:].strip()
+            if content:
+                user_texts.append(content)
 
     if not user_texts:
+        # 只有注入消息、没有真实用户输入 → 默认放行，不用复杂模型
         return {
-            "complexity": "complex", "task_type": "other",
+            "complexity": "simple", "task_type": "other",
             "confidence": 0.5, "method": "rule",
-            "reasoning": "no user messages",
+            "reasoning": "no real user message (system injection only)",
         }
 
     message = user_texts[-1]
