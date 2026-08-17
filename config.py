@@ -418,6 +418,14 @@ _BOOTSTRAP_TEXT = (
     "    ucb_c: 1.0\n"
     "    alpha: 0.012\n"
     "    base_reward: 100.0\n"
+    "    budget: 0.002        # $/请求 预算上限（Budget Pacer, 0=关闭）\n"
+    "    lambda_c: 0.3        # 静态成本偏好\n"
+    "    prices: {}           # 模型 → $/1k tokens，空则默认 0.001\n"
+    "    quality_w: 1.0\n"
+    "    cost_w: 0.4\n"
+    "    latency_w: 0.3\n"
+    "    burn_in_pulls: 20\n"
+    "    tie_eps: 0.02\n"
 )
 
 

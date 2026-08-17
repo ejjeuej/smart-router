@@ -338,11 +338,14 @@ def on_llm_execution(request, next_call, **context):
                         modified, "complex" if pool_key == "complex_models" else "simple")
                     info(f"bandit → {pool_key}({task_type}) → "
                           f"{selected['model']}")
+                    _t_call = time.monotonic()
                     response = client.chat.completions.create(**modified)
+                    _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
 
                     total_tokens = response.usage.total_tokens if response.usage else 0
                     bandit.update(selected["model"], success=True,
-                                  total_tokens=total_tokens, task_type=task_type)
+                                  total_tokens=total_tokens, task_type=task_type,
+                                  latency_ms=_latency_call_ms)
                     save_one(pool_key)
 
                     routed_tier = "complex" if pool_key == "complex_models" else "simple"
@@ -374,7 +377,8 @@ def on_llm_execution(request, next_call, **context):
                     if _is_quota_exhausted(err_str):
                         exhausted_models.add(selected["model"])
                         bandit.update(selected["model"], success=False,
-                                      total_tokens=0, task_type=task_type)
+                                      total_tokens=0, task_type=task_type,
+                                      penalty=0.5)  # 借鉴点50: 软惩罚, 恢复后回血
                         info(f"quota exhausted for "
                               f"{selected['model']}, down-ranked (本轮跳过，"
                               f"后续轮次/下次额度恢复会重试)")
@@ -385,6 +389,9 @@ def on_llm_execution(request, next_call, **context):
                     elif any(s in err_str for s in
                              ("429", "500", "502", "503", "504")):
                         round_blacklist.add(selected["model"])
+                        bandit.update(selected["model"], success=False,
+                                      total_tokens=0, task_type=task_type,
+                                      penalty=0.3)  # 借鉴点50: 故障期降权, 可自动恢复
                         info(f"server error for "
                               f"{selected['model']}, skipping this round")
                     else:
@@ -416,12 +423,15 @@ def on_llm_execution(request, next_call, **context):
             modified = _inject_tier_hint(
                 modified, "complex" if pool_key == "complex_models" else "simple")
             info(f"fallback {pool_key}({task_type}) → {c['model']}")
+            _t_call = time.monotonic()
             response = client.chat.completions.create(**modified)
+            _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
 
             if use_bandit:
                 total_tokens = response.usage.total_tokens if response.usage else 0
                 bandit.update(c["model"], success=True,
-                              total_tokens=total_tokens, task_type=task_type)
+                              total_tokens=total_tokens, task_type=task_type,
+                              latency_ms=_latency_call_ms)
                 save_one(pool_key)
 
             routed_tier = "complex" if pool_key == "complex_models" else "simple"
@@ -452,7 +462,7 @@ def on_llm_execution(request, next_call, **context):
                 exhausted_models.add(c["model"])
                 if use_bandit:
                     bandit.update(c["model"], success=False, total_tokens=0,
-                                  task_type=task_type)
+                                  task_type=task_type, penalty=0.5)  # 借鉴点50
                 info(f"quota exhausted for {c['model']}, "
                       f"down-ranked (本轮跳过，后续轮次/下次额度恢复会重试)")
             elif _is_permanent_broken(err_str):
@@ -462,6 +472,9 @@ def on_llm_execution(request, next_call, **context):
             elif any(s in err_str for s in
                      ("429", "500", "502", "503", "504")):
                 round_blacklist.add(c["model"])
+                if use_bandit:
+                    bandit.update(c["model"], success=False, total_tokens=0,
+                                  task_type=task_type, penalty=0.3)  # 借鉴点50
                 info(f"server error for {c['model']}, "
                       f"skipping this round")
             else:
