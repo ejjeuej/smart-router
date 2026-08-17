@@ -4,10 +4,10 @@ Intent classification + routing engine — local heuristics with session-state t
 Architecture:
   1. ConversationState — 布尔 last_turn_complex 记录上一轮是否 complex
   2. extract_features() — pure regex, <1ms
-  3. route() — 11-branch decision engine, LLM only as last resort (~20% traffic)
+  3. route() — 15-branch decision engine, LLM only as last resort (~20% traffic)
   4. classify() — public API (backward-compatible with existing callers)
 
-Decision order (each branch returns tier + branch name for conf lookup):
+Decision order (each branch returns tier + branch name):
   R1  user override      — 用户明说难易（认真/随便/省钱…），命中即短路
   R0b downgrade          — 用户放弃/停止当前任务（算了/不用了/别分析了…）
                             → 强制 simple + 重置上下文（借鉴点 15）
@@ -25,10 +25,6 @@ Decision order (each branch returns tier + branch name for conf lookup):
   R2.5 grey zone         — 无类型且 10<len≤200 → LLM 灰区
   R3  type weight        — 按任务类型权重评分
   R4  LLM fallback       — 仅灰区到这里（~20% traffic）
-
-confidence 语义（借鉴点 38）: P(simple 档够用 | 当前分支)。
-0.9+ ≈ 几乎确定 simple 就够；0.1- ≈ 几乎确定必须 complex；中间 = 灰区。
-后续桥接 bandit Q_prior（借鉴点 2）时直接映射。
 
 Key insight: classification input was missing context. "解释一下" in a complex
 coding session should route to complex models, but any single-message classifier
@@ -271,30 +267,6 @@ def _is_short_ack(message: str) -> bool:
     return normalized in _SHORT_ACKS
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# confidence 分档（借鉴点 30 — ThinkGate 各分支固定 conf）
-# 语义（借鉴点 38）= P(simple 档够用 | 当前分支)。非"判断置信度"。
-# 桥接 bandit Q_prior（借鉴点 2）时直接映射：conf 高 → simple 先验强。
-# ═══════════════════════════════════════════════════════════════════════════
-
-_BRANCH_CONF = {
-    "override_complex": 0.05,   # R1 用户明说复杂
-    "override_simple": 0.95,    # R1 用户明说简单
-    "r0_downgrade": 0.90,       # R0b 用户放弃/停止当前任务 → simple 够用
-    "r0_context": 0.15,         # R0 上下文继承（延续上一轮 complex）
-    "r0_continue": 0.90,        # R0 上轮 simple + 继续专属词 → 延续简单档
-    "r2_code_math": 0.10,       # R2 显式代码/数学信号
-    "r2_long_signal": 0.35,     # R2b 长+弱信号（可能是粘贴）
-    "r2_complex_signal": 0.15,  # R2c 复杂度信号词（架构/分布式/死锁…，比代码信号弱一档）
-    "r2_multi_q": 0.20,         # R2d 多问号+够长 → 分析型
-    "r23_short": 0.95,          # R2.3 寒暄/致谢/短确认
-    "r24_mech": 0.90,           # R2.4 机械词 → simple 够用
-    "r3_complex": 0.25,         # R3 类型权重高（code_gen/analysis/debug）
-    "r3_simple": 0.80,          # R3 类型权重低（factual）
-    "r4_llm": 0.50,             # R4 LLM 兜底：LLM 结果不带置信度 → 中性
-    "no_user": 0.50,            # 无真实用户消息
-}
-
 # 短跟帖词表：上一轮 complex 时，含这些词的短句视为「延续上下文」而非新问题
 # （"解释一下" / "继续" / "为什么"…）。配合布尔 last_turn_complex，替代原来的
 # 衰减分数——不会再把"你是谁""hi"这类新问题误判成 complex。
@@ -398,7 +370,7 @@ def _is_knowledge_ask(message: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Routing engine — 8 branches, each returns (tier, branch_name)
+# Routing engine — 15 branches, each returns (tier, branch_name)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _route_with_branch(message: str, state: ConversationState):
@@ -516,8 +488,7 @@ def _route_with_branch(message: str, state: ConversationState):
 def route(message: str, state: ConversationState) -> str:
     """Return "simple" or "complex" — the model tier to use.
 
-    Backward-compatible shell over _route_with_branch(); classify() uses the
-    branch name for confidence lookup.
+    Backward-compatible shell over _route_with_branch().
     """
     tier, _branch = _route_with_branch(message, state)
     return tier
@@ -620,8 +591,8 @@ def classify(messages, classifier_cfg=None):
 
     Returns:
         {"complexity": "simple"|"complex", "task_type": "...",
-         "confidence": 0.0~1.0, "method": "rule"|"llm", "reasoning": "...",
-         "cost_mode": "cheap"|"normal"}   # cost_mode 供 bandit 请求级 threshold 用
+         "method": "rule"|"llm", "reasoning": "...",
+         "cost_mode": "cheap"|"normal"}
     """
     # Extract last user message.
     # Hermes 切换模型时会注入 role="user" 的元数据消息:
@@ -644,7 +615,7 @@ def classify(messages, classifier_cfg=None):
         # 只有注入消息、没有真实用户输入 → 默认放行，不用复杂模型
         return {
             "complexity": "simple", "task_type": "other",
-            "confidence": _BRANCH_CONF["no_user"], "method": "rule",
+            "method": "rule",
             "reasoning": "no real user message (system injection only)",
             "cost_mode": "normal",
         }
@@ -666,21 +637,17 @@ def classify(messages, classifier_cfg=None):
         return {
             "complexity": tier,
             "task_type": task_type,
-            "confidence": _BRANCH_CONF["r4_llm"],
             "method": "llm",
             "reasoning": f"llm_fallback ({branch}, {latency_ms}ms)",
             "cost_mode": "normal",
         }
 
-    # rule-based — no LLM call.  confidence 按分支查表（借鉴点 30）。
-    confidence = _BRANCH_CONF.get(branch, 0.5)
     # 借鉴点 32: 用户明说"随便/省钱" → cost_mode="cheap"（本阶段仅透传，
     # bandit 请求级 threshold 落地时再消费）。
     cost_mode = "cheap" if branch == "override_simple" else "normal"
     return {
         "complexity": tier,
         "task_type": task_type,
-        "confidence": confidence,
         "method": "rule",
         "reasoning": _reasoning_from_features(f, tier, branch),
         "cost_mode": cost_mode,
@@ -778,4 +745,4 @@ def _call_llm_to_classify(user_message, classifier_cfg):
 
     # (implementation omitted — deprecated)
     return {"complexity": "simple", "task_type": "other",
-            "confidence": 0.5, "method": "llm", "reasoning": "deprecated"}
+            "method": "llm", "reasoning": "deprecated"}

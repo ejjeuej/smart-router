@@ -25,7 +25,6 @@ def log_classification(
     user_message,
     complexity,
     task_type,
-    confidence,
     reasoning="",
     method="rule",
     latency_ms=0,
@@ -39,7 +38,6 @@ def log_classification(
     user_message:  用户输入（截断到前 500 字符）
     complexity:    simple / medium / complex
     task_type:     chat / coding / reasoning / writing / analysis / translation / other
-    confidence:    0.0 ~ 1.0
     reasoning:     分类理由简述
     method:        llm / rule
     latency_ms:    分类耗时（毫秒）
@@ -52,7 +50,6 @@ def log_classification(
         "user_message": user_message[:500],
         "complexity": complexity,
         "task_type": task_type,
-        "confidence": confidence,
         "reasoning": reasoning,
         "method": method,
         "latency_ms": latency_ms,

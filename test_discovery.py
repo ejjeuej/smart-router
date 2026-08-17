@@ -99,7 +99,7 @@ def main():
                 "GRE 逻辑题：若 A 则 B，非 B，所以？"]:
         r = classify([{"role": "user", "content": msg}])
         print(f"  「{msg}」 → {r['complexity']}/{r['task_type']} "
-              f"(method={r['method']}, conf={r['confidence']})")
+              f"(method={r['method']})")
 
     # ── 3. 真实路由：选模 → 调用 → 学习/拉黑 → 再选 ────────────────
     section("3. 真实路由：bandit 选模 → 实际调用 → 学习/拉黑")
