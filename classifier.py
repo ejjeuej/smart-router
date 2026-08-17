@@ -4,13 +4,17 @@ Intent classification + routing engine — local heuristics with session-state t
 Architecture:
   1. ConversationState — 布尔 last_turn_complex 记录上一轮是否 complex
   2. extract_features() — pure regex, <1ms
-  3. route() — 8-branch decision engine, LLM only as last resort (~20% traffic)
+  3. route() — 11-branch decision engine, LLM only as last resort (~20% traffic)
   4. classify() — public API (backward-compatible with existing callers)
 
 Decision order (each branch returns tier + branch name for conf lookup):
   R1  user override      — 用户明说难易（认真/随便/省钱…），命中即短路
   R0  context inheritance— 上一轮 complex + 短跟帖词 → 延续 complex
-  R2  explicit complex   — code/math 信号（需 length>20）；长+弱信号才升
+  R2  explicit complex   — code/math/语言签名信号（需 length>20）
+  R2b long + weak signal — 长且带特征才升，纯长粘贴不定级
+  R2c complex signal     — 无代码但明显复杂（架构/分布式/死锁/证明…），需
+                            length>10 且非纯求知（什么是/解释…）
+  R2d multi-question     — ≥3 个问号且 len>40 → 分析型请求
   R2.3 short confirm     — 寒暄/致谢/整词表短确认 → simple
   R2.4 mech layer        — 机械词（翻译/润色/格式化…）→ simple，不调 LLM
   R2.5 grey zone         — 无类型且 10<len≤200 → LLM 灰区
@@ -82,6 +86,28 @@ CODE_PATTERN = (
     r"\.py|\.ts|\.js|\.json|\.yaml|\.toml"
 )
 
+# 语言签名（L2 层）：每种主流语言 1-2 个"该语言独有、正常文本几乎不会出现"的签名。
+# 铁律：只加零误伤签名（func/fn/:=/if err != nil…），不加 if/return/let 这类英文常用词，
+# 否则词表会逼近英语单词表，误伤面爆炸。漏判有灰区 LLM 兜底（不烧贵模型），
+# 误判才烧钱，所以宁可少而精，不能多而滥。
+LANGUAGE_SIGNATURES = (
+    r"func ",                  # Go/Rust 函数定义
+    r"(?m:^package\s)",        # Go 包声明（限定行首，防 "package manager" 误伤）
+    r"fn ",                    # Rust 函数
+    r"#include|int main",      # C/C++
+    r"public class",           # Java/C#
+    r"let mut",                # Rust 变量声明（裸 let 是英文常用词，不放）
+    r"println!|println\(",     # Rust/Go 输出宏
+    r"use std::|use crate::",  # Rust 模块导入
+    r"select \* from|create table",  # SQL（select 要求带 *，防 "please select from"）
+    r"npm |pip install|go get",      # 包管理命令
+    r"if err != nil",          # Go 错误处理惯用法
+    r":=",                     # Go 短变量声明
+    r"=>",                     # JS/TS 箭头函数
+    r"\.go\b|\.rs\b|\.java\b|\.cpp\b|\.rb\b|\.php\b",  # 语言扩展名（需点号前缀）
+)
+_LANG_SIG_PATTERN = "|".join(LANGUAGE_SIGNATURES)
+
 MATH_PATTERN = r"[∑∫∂∇∀∃≤≥≠∞]|方程|概率|分布|矩阵|微积分|梯度|导数|定理|证明"
 
 
@@ -100,13 +126,19 @@ def extract_features(message: str) -> dict:
 
     return {
         "length": len(message),
-        "has_code": bool(re.search(CODE_PATTERN, msg_lower)),
+        # has_code = 通用代码骨架（围栏/def/import/扩展名/报错词）+ 语言签名表。
+        # 两条正则任一命中即可；语言签名保证 Go/Rust/C/Java/SQL 等不再漏判。
+        "has_code": bool(
+            re.search(CODE_PATTERN, msg_lower)
+            or re.search(_LANG_SIG_PATTERN, msg_lower)
+        ),
         "has_math": bool(re.search(MATH_PATTERN, msg_lower)),
         "has_reference": bool(re.search(REFERENCE_PATTERN, message)),
         "is_ellipsis": len(message) < 15,
         "question_type": q_type,
         "type_matched": type_matched,
         "has_confusion": bool(re.search(r"不懂|没看懂|困惑|不理解", message)),
+        "q_mark_count": len(re.findall(r"[?？]", msg_lower)),  # R2d 多问号密度
         "is_greeting": bool(re.match(
             r"^(hello|hi\b|hey\b|nihao|yo\b|sup\b|你好|早上好|晚上好|下午好)",
             msg_lower,
@@ -246,6 +278,8 @@ _BRANCH_CONF = {
     "r0_context": 0.15,         # R0 上下文继承（延续上一轮 complex）
     "r2_code_math": 0.10,       # R2 显式代码/数学信号
     "r2_long_signal": 0.35,     # R2b 长+弱信号（可能是粘贴）
+    "r2_complex_signal": 0.15,  # R2c 复杂度信号词（架构/分布式/死锁…，比代码信号弱一档）
+    "r2_multi_q": 0.20,         # R2d 多问号+够长 → 分析型
     "r23_short": 0.95,          # R2.3 寒暄/致谢/短确认
     "r24_mech": 0.90,           # R2.4 机械词 → simple 够用
     "r3_complex": 0.25,         # R3 类型权重高（code_gen/analysis/debug）
@@ -268,6 +302,46 @@ def _is_followup(message: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# R2c: 复杂度信号（ThinkGate think/ultrathiinkSignals + fog STRONG_PATTERNS）
+# 判断"这活难不难"的独立维度，与 TYPE_PATTERNS（这活是哪类）不冲突。
+# "架构/分布式/死锁/证明"这类请求没有代码块，但明显复杂——在 R2 位置直接升，
+# 比走到 R3 类型权重（最高 0.8）更早更直接。
+# 防误伤：① length>10（"架构""证明"两三个字单独出现不升）
+#        ② 非纯求知（"什么是微服务架构""解释一下"这类是讲解需求，不是干活）
+# ═══════════════════════════════════════════════════════════════════════════
+
+_COMPLEX_SIGNALS = (
+    # 架构/系统设计级（ThinkGate ultrathink 语义 + fog 中文）
+    "架构", "系统设计", "分布式", "微服务", "数据库设计", "多租户",
+    "生产级", "生产环境", "安全威胁模型", "平台迁移", "从零实现", "从零写",
+    "规模化", "at scale", "distributed system", "architecture",
+    "multi-tenant", "production-grade", "from scratch",
+    # 分析/审查级（ThinkGate thinkSignals）
+    "代码审查", "code review", "根因分析", "root cause", "竞态", "race condition",
+    "死锁", "deadlock", "性能优化", "optimize", "权衡", "trade-off", "tradeoff",
+    "重构", "refactor", "调试", "debug",
+    # 数学/证明级
+    "证明", "prove that", "定理", "theorem", "推导",
+)
+
+# 求知型词：信号词出现在"什么是X/解释X/区别"里时，是讲解需求而非实际任务。
+# 带这些词的请求走解释/类型权重流程（短句甚至直接 simple），不升 complex。
+_KNOWLEDGE_ASKS = (
+    "什么是", "啥是", "是什么", "解释", "讲讲", "介绍一下", "科普", "区别",
+)
+
+
+def _has_complex_signal(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in _COMPLEX_SIGNALS)
+
+
+def _is_knowledge_ask(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in _KNOWLEDGE_ASKS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Routing engine — 8 branches, each returns (tier, branch_name)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -277,8 +351,10 @@ def _route_with_branch(message: str, state: ConversationState):
     Branch order:
       R1   user override（用户明说难易）→ 最强信号，先查
       R0   context inheritance（上一轮 complex + 跟帖）
-      R2   explicit complex（code/math 需 length>20）
+      R2   explicit complex（code/math/语言签名需 length>20）
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
+      R2c  complex signal（架构/分布式/死锁…，length>10 且非纯求知）
+      R2d  multi-question（≥3 问号且 len>40 → 分析型）
       R2.3 short confirm / greeting / thanks → simple
       R2.4 mech layer（机械词 → simple，不调 LLM）
       R2.5 no-type grey zone → llm
@@ -315,6 +391,19 @@ def _route_with_branch(message: str, state: ConversationState):
     # 继续往下走，最终落到 R3 factual → simple。
     if f["length"] > 200 and (f["has_code"] or f["has_math"] or f["type_matched"]):
         return "complex", "r2_long_signal"
+
+    # R2c: 复杂度信号（架构/分布式/死锁/证明…）— 无代码但明显复杂。
+    # 防误伤双闸：length>10（"架构""证明"两三字不升）+ 非纯求知
+    # （"什么是微服务架构""解释一下"是讲解需求，不升，交给类型权重/灰区）。
+    if (_has_complex_signal(message)
+            and f["length"] > 10
+            and not _is_knowledge_ask(message)):
+        return "complex", "r2_complex_signal"
+
+    # R2d: 多问号密度（借鉴点 29 — ThinkGate questionMarks 特征）
+    # ≥3 个问号且够长 → 连续追问/分析型请求（"如何做A？如何保证B？如何优化C？"）。
+    if f["q_mark_count"] >= 3 and f["length"] > 40:
+        return "complex", "r2_multi_q"
 
     # R2.3: 短确认/寒暄/致谢 → simple。
     # 借鉴点 28: 整词表命中直接 simple（"好的！"/"ok?" 不再误判）；
