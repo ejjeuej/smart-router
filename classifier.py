@@ -9,7 +9,12 @@ Architecture:
 
 Decision order (each branch returns tier + branch name for conf lookup):
   R1  user override      — 用户明说难易（认真/随便/省钱…），命中即短路
-  R0  context inheritance— 上一轮 complex + 短跟帖词 → 延续 complex
+  R0b downgrade          — 用户放弃/停止当前任务（算了/不用了/别分析了…）
+                            → 强制 simple + 重置上下文（借鉴点 15）
+  R0c task-switch        — 用户换话题（换个话题/不提这个…）→ 刷新上下文，
+                            不直接定档，继续往下走（借鉴点 15）
+  R0  context inheritance— 上轮 complex + 短跟帖词 → 延续 complex；
+                            上轮 simple + 继续专属词 → 复用 simple（借鉴点 15）
   R2  explicit complex   — code/math/语言签名信号（需 length>20）
   R2b long + weak signal — 长且带特征才升，纯长粘贴不定级
   R2c complex signal     — 无代码但明显复杂（架构/分布式/死锁/证明…），需
@@ -275,7 +280,9 @@ def _is_short_ack(message: str) -> bool:
 _BRANCH_CONF = {
     "override_complex": 0.05,   # R1 用户明说复杂
     "override_simple": 0.95,    # R1 用户明说简单
+    "r0_downgrade": 0.90,       # R0b 用户放弃/停止当前任务 → simple 够用
     "r0_context": 0.15,         # R0 上下文继承（延续上一轮 complex）
+    "r0_continue": 0.90,        # R0 上轮 simple + 继续专属词 → 延续简单档
     "r2_code_math": 0.10,       # R2 显式代码/数学信号
     "r2_long_signal": 0.35,     # R2b 长+弱信号（可能是粘贴）
     "r2_complex_signal": 0.15,  # R2c 复杂度信号词（架构/分布式/死锁…，比代码信号弱一档）
@@ -291,14 +298,63 @@ _BRANCH_CONF = {
 # 短跟帖词表：上一轮 complex 时，含这些词的短句视为「延续上下文」而非新问题
 # （"解释一下" / "继续" / "为什么"…）。配合布尔 last_turn_complex，替代原来的
 # 衰减分数——不会再把"你是谁""hi"这类新问题误判成 complex。
+# 注意（借鉴点 15 修坑，对应文档坑 A2）：「然后/下一步」这类高频连接词不放——
+# "然后帮我查下 XX" 是新问题，不是延续上一轮。
 FOLLOWUP_PATTERNS = (
-    "解释", "继续", "详细", "展开", "具体", "然后", "为什么",
+    "解释", "继续", "详细", "展开", "具体", "为什么",
     "什么意思", "举例", "接着",
 )
 
 
 def _is_followup(message: str) -> bool:
     return any(p in message for p in FOLLOWUP_PATTERNS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R0b/R0c/R0: 跨轮 session 关系（借鉴点 15 — fog 跨轮检测 + SSR 会话机制）
+# 单轮文本分类器无记忆，但会话状态里有上一轮档位。三类关系词：
+#   downgrade — 用户放弃/停止当前任务（"算了/不用了"）→ 强制 simple + 重置状态
+#   task-switch — 用户换话题（"换个话题/不提这个"）→ 刷新状态，不直接定档
+#   continue — 延续上轮（"继续/接着说"）→ 复用上轮档位（simple 复用、complex 继承）
+# 铁律：continue 只放"延续专属词"，排除"然后/下一步/接下来"这类高频连接词——
+# 它们经常引出新任务（"然后帮我查下 XX"），误判会把新问题锁死在上轮档位。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 降级词：用户明确放弃当前任务。命中即 simple——会话管理信号，几乎不会出现在
+# 真正的任务请求里（"不用了谢谢"也是结束语，simple 合理）。
+_DOWNGRADE_WORDS = (
+    "算了", "算了算了", "不用了", "不用弄了", "不用继续", "别继续了",
+    "别分析了", "不用分析了", "不分析了", "别弄了", "不弄了",
+    "先这样吧", "到此为止", "停一下", "别管了", "不用管", "不问了",
+)
+
+# 话题切换词：只放"换话题"专属长词。"换一个思路/换个方案"是继续当前任务的
+# 细化，不是换话题，所以不带宾语的裸"换一个"不放。
+_TASK_SWITCH_WORDS = (
+    "换个话题", "换个问题", "换个任务", "换个方向", "换别的",
+    "不说这个", "不提这个", "不聊这个", "不讨论这个", "跳过这个话题",
+    "先不管", "先放一放",
+)
+
+# continue 专属词：延续上轮话题。上轮 complex 时走 R0 继承分支，
+# 上轮 simple 时走 r0_continue 分支。全是"接着干"语义，无新任务引出词。
+_CONTINUE_WORDS = (
+    "继续", "接着说", "接着上", "接上文", "go on", "continue",
+    "keep going", "carry on", "然后呢",
+)
+
+
+def _is_downgrade(message: str) -> bool:
+    return any(w in message for w in _DOWNGRADE_WORDS)
+
+
+def _is_task_switch(message: str) -> bool:
+    return any(w in message for w in _TASK_SWITCH_WORDS)
+
+
+def _is_continue(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in _CONTINUE_WORDS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -350,7 +406,10 @@ def _route_with_branch(message: str, state: ConversationState):
 
     Branch order:
       R1   user override（用户明说难易）→ 最强信号，先查
-      R0   context inheritance（上一轮 complex + 跟帖）
+      R0b  downgrade（用户放弃任务 → 强制 simple + 重置状态）
+      R0c  task-switch（用户换话题 → 刷新状态，不直接定档，继续往下走）
+      R0   context inheritance（上轮 complex + 跟帖 → complex；
+                                上轮 simple + 继续专属词 → simple）
       R2   explicit complex（code/math/语言签名需 length>20）
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
       R2c  complex signal（架构/分布式/死锁…，length>10 且非纯求知）
@@ -371,14 +430,31 @@ def _route_with_branch(message: str, state: ConversationState):
     if override == "simple":
         return "simple", "override_simple"
 
-    # R0: 上下文继承（布尔 last_turn_complex + 短跟帖词表）
+    # R0b: 降级重评（借鉴点 15 — 用户放弃/停止当前任务）
+    # "算了/不用了/别分析了" → 任务终结，强制 simple + 重置上下文。
+    # 会话管理信号优先级高于上下文继承：用户明确放弃 > 延续上一轮。
+    if _is_downgrade(message):
+        state.last_turn_complex = False
+        return "simple", "r0_downgrade"
+
+    # R0c: 话题切换（借鉴点 15 — 用户换话题）
+    # 命中只刷新状态（上轮 complex 不再继承），不直接定档——新话题
+    # 是好是坏交给后续规则正常判断。
+    if _is_task_switch(message):
+        state.last_turn_complex = False
+
+    # R0: 上下文继承（布尔 last_turn_complex + 跟帖/继续词）
     #
-    # 上一轮是 complex，且本句是「引用上一轮」（"那个"/"它"）或短跟帖
-    # （"解释一下"/"继续"/"为什么"…）→ 延续 complex。
+    # ① 上一轮是 complex，且本句是「引用上一轮」（"那个"/"它"）或短跟帖
+    #   （"解释一下"/"继续"/"为什么"…）→ 延续 complex。
+    # ② 上一轮是 simple，且本句是继续专属词（"继续"/"接着说"/"然后呢"…）
+    #   → 复用 simple（借鉴点 15 补齐的"向下复用"方向）。
     # 布尔信号替代原来的衰减分数：同一条消息在任何 session 状态下结果一致，
     # 不会把"你是谁""hi"这类新问题误判成 complex。
     if state.last_turn_complex and (f["has_reference"] or _is_followup(message)):
         return "complex", "r0_context"
+    if not state.last_turn_complex and _is_continue(message):
+        return "simple", "r0_continue"
 
     # R2: explicit complex signals — no LLM needed
     # 借鉴点 1+B6: code/math 还需 length>20，防 "pip install"/"import os" 这类
@@ -515,6 +591,26 @@ def _llm_classify_fast(message: str, state: ConversationState,
 # ═══════════════════════════════════════════════════════════════════════════
 # Public API — backward-compatible with existing callers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def get_tier_hint(new_tier: str) -> str:
+    """借鉴点 22 — LLM 档位感知提示（fog get_routing_hint 三态）。
+
+    给 LLM 看的 system 提示：告诉它自己被路由到哪档、期望什么行为
+    （simple 精简 / complex 深入）。与 announce（给用户看，__init__.py 脚注）
+    分离——这个给模型看，那个给用户看。
+    三态：首次（无上轮记录）/ 同档 / 换档。档位切换时内容跟着变。
+    __init__.py 在调用模型前注入 messages；任何异常由调用方兜底跳过。
+    """
+    prev = get_state().last_model_tier
+    if prev == new_tier:
+        header = f"当前为 {new_tier} 档（与上轮一致）"
+    else:
+        header = f"本轮路由至 {new_tier} 档"
+    if new_tier == "simple":
+        return (f"[routing] {header}。请保持精简：直接给结论，"
+                f"不要过度设计、不要长篇展开。")
+    return (f"[routing] {header}。可深入分析、多步规划、给出完整方案。")
+
 
 def classify(messages, classifier_cfg=None):
     """Classify user task by complexity and type.

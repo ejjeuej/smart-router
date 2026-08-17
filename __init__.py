@@ -150,6 +150,40 @@ def _annotate_response(response, cfg, model_routed, complexity, task_type,
     return response
 
 
+def _inject_tier_hint(request: dict, tier: str) -> dict:
+    """借鉴点 22 — LLM 档位感知提示注入。
+
+    把 get_tier_hint()（三态：首次/同档/换档）拼进 messages：
+    - 已有 system 消息 → 追加到其 content 末尾
+    - 没有 → 在最前插入一条新 system 消息
+    与 _annotate_response（给用户看的脚注）分离——这个给模型看。
+    返回新 dict，不修改原 request。任何异常静默返回原 request（不阻断路由）。
+    """
+    try:
+        from classifier import get_tier_hint
+        hint = get_tier_hint(tier)
+        if not hint:
+            return request
+        msgs = []
+        injected = False
+        for m in request.get("messages", []):
+            if not injected and m.get("role") == "system":
+                m2 = dict(m)
+                m2["content"] = str(m.get("content", "")) + "\n\n" + hint
+                msgs.append(m2)
+                injected = True
+            else:
+                msgs.append(m)
+        if not injected:
+            msgs.insert(0, {"role": "system", "content": hint})
+        modified = dict(request)
+        modified["messages"] = msgs
+        return modified
+    except Exception as e:
+        info(f"inject tier hint failed: {e}")
+        return request
+
+
 def on_llm_execution(request, next_call, **context):
     global _last_routed
     cfg = load_router_config()
@@ -299,6 +333,9 @@ def on_llm_execution(request, next_call, **context):
                     modified.pop("stream", None)
                     modified.pop("stream_options", None)
                     modified.pop("enable_thinking", None)
+                    # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
+                    modified = _inject_tier_hint(
+                        modified, "complex" if pool_key == "complex_models" else "simple")
                     info(f"bandit → {pool_key}({task_type}) → "
                           f"{selected['model']}")
                     response = client.chat.completions.create(**modified)
@@ -376,6 +413,9 @@ def on_llm_execution(request, next_call, **context):
             modified.pop("stream", None)
             modified.pop("stream_options", None)
             modified.pop("enable_thinking", None)
+            # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
+            modified = _inject_tier_hint(
+                modified, "complex" if pool_key == "complex_models" else "simple")
             info(f"fallback {pool_key}({task_type}) → {c['model']}")
             response = client.chat.completions.create(**modified)
 
