@@ -4,8 +4,22 @@ Intent classification + routing engine — local heuristics with session-state t
 Architecture:
   1. ConversationState — 布尔 last_turn_complex 记录上一轮是否 complex
   2. extract_features() — pure regex, <1ms
-  3. route() — 4-layer decision engine, LLM only as last resort (~20% traffic)
+  3. route() — 8-branch decision engine, LLM only as last resort (~20% traffic)
   4. classify() — public API (backward-compatible with existing callers)
+
+Decision order (each branch returns tier + branch name for conf lookup):
+  R1  user override      — 用户明说难易（认真/随便/省钱…），命中即短路
+  R0  context inheritance— 上一轮 complex + 短跟帖词 → 延续 complex
+  R2  explicit complex   — code/math 信号（需 length>20）；长+弱信号才升
+  R2.3 short confirm     — 寒暄/致谢/整词表短确认 → simple
+  R2.4 mech layer        — 机械词（翻译/润色/格式化…）→ simple，不调 LLM
+  R2.5 grey zone         — 无类型且 10<len≤200 → LLM 灰区
+  R3  type weight        — 按任务类型权重评分
+  R4  LLM fallback       — 仅灰区到这里（~20% traffic）
+
+confidence 语义（借鉴点 38）: P(simple 档够用 | 当前分支)。
+0.9+ ≈ 几乎确定 simple 就够；0.1- ≈ 几乎确定必须 complex；中间 = 灰区。
+后续桥接 bandit Q_prior（借鉴点 2）时直接映射。
 
 Key insight: classification input was missing context. "解释一下" in a complex
 coding session should route to complex models, but any single-message classifier
@@ -117,6 +131,129 @@ TYPE_WEIGHTS = {
     "factual": 0.2,
 }
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R1: 用户显式意图词（借鉴点 26 — ThinkGate detectOverride）
+# 用户自己说了难易，是最可靠信号。命中即短路，跳过后续所有判断。
+# 只放"无歧义"词；"帮我写""帮我看"这类太宽（会误伤"帮我写一句话回复"），不放。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_OVERRIDE_COMPLEX = (
+    # 明说深度处理
+    "认真想想", "认真分析", "认真思考", "认真检查",
+    "仔细想想", "仔细分析", "仔细思考", "仔细检查",
+    "深入分析", "深入思考", "深入想想", "深入理解",
+    "详细分析", "详细说", "详细解释", "详细讲讲",
+    # 明说要方案/设计/规划
+    "帮我分析", "帮我设计", "帮我规划",
+    "写个方案", "给个方案", "制定方案", "设计方案",
+    # 明说证明/推导
+    "推导一下", "证明一下", "论证一下", "严格论证",
+)
+
+# cheap 意图（借鉴点 32）：除锁 simple 外，classify() 返回 cost_mode="cheap"，
+# 供后续 bandit 请求级 threshold 使用（本阶段仅透传，不消费）。
+_OVERRIDE_SIMPLE = (
+    # 明说"随便/简单"
+    "随便", "随便弄", "随便看看", "随便写写",
+    "简单弄", "简单点", "简单搞", "简单说", "简答",
+    "快速搞定", "快速弄", "快速写", "快速回",
+    "不用太细", "不用太认真", "差不多就行", "意思一下",
+    # 省钱类
+    "省钱", "省点钱", "便宜点", "用便宜", "低成本", "少花钱",
+)
+
+
+def _detect_user_override(message: str):
+    """R1: 用户显式意图。命中返回 "complex"/"simple"，否则 None。
+
+    复杂词优先（宁升不降原则）："随便帮我分析一下" → complex。
+    """
+    m = message.lower()
+    for w in _OVERRIDE_COMPLEX:
+        if w in m:
+            return "complex"
+    for w in _OVERRIDE_SIMPLE:
+        if w in m:
+            return "simple"
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R2.4: 机械层（借鉴点 21+27 — ThinkGate fastSignals）
+# "内容再长也是机械活" → 直接 simple，不调 LLM。用子串匹配，词条选"无歧义"。
+# 与 ThinkGate 的差异：命中还要求无 code/math 信号，避免"翻译一下这段代码"误杀。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_MECH_SIMPLE = (
+    # 翻译类
+    "翻译", "译成", "英译中", "中译英", "英翻中", "中翻英",
+    # 润色/校对/格式类
+    "润色", "改错别字", "改病句", "校对", "格式化", "排版", "缩句", "扩写",
+    # 机械摘要（针对报错/日志，不含泛化"总结"）
+    "总结报错", "总结错误", "总结日志", "summarize this error",
+    # 简单查询
+    "现在几点", "今天几号", "看下时间", "查一下时间", "查天气", "查一下天气", "what time",
+    # 机械命令（ThinkGate 原词保留，中文补对照）
+    "git status", "git diff", "git log", "npm test", "pytest", "vitest",
+    "typecheck", "fix typo", "format this json", "read file",
+    "读一下文件", "读取文件", "打开文件",
+)
+
+
+def _is_mech_simple(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in _MECH_SIMPLE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R2.3 增强: 短确认整词表（借鉴点 28 — ThinkGate isShortAck）
+# 替代纯 length<=3 一刀切：先去尾标点再整词匹配；查不到再退长度条件
+# （与 ThinkGate 双条件一致，见 R2.3 分支）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SHORT_ACKS = frozenset({
+    # 中文
+    "嗯", "好", "好的", "行", "可以", "没问题", "收到",
+    "明白了", "懂了", "知道", "知道了", "谢谢", "感谢", "多谢",
+    "对", "对的", "是的", "没错", "是", "继续", "再来", "下一步",
+    # 英文（ThinkGate 24 词保留）
+    "yes", "yep", "yeah", "yup", "ok", "okay", "okey", "k", "kk",
+    "sure", "fine", "good", "thanks", "thank you", "ty", "got it",
+    "perfect", "done", "cool", "right", "great", "nice",
+    "go", "go ahead", "proceed", "stop", "continue", "same",
+    "nl", "lgtm", "ship it", "do that",
+})
+
+# 去尾标点 + 空白后整词匹配（"好的！"→"好的"；"好？"→"好"）
+_ACK_TRIM = "!?.,。！？，、～~ \t"
+
+
+def _is_short_ack(message: str) -> bool:
+    normalized = message.lower().strip().rstrip(_ACK_TRIM)
+    return normalized in _SHORT_ACKS
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# confidence 分档（借鉴点 30 — ThinkGate 各分支固定 conf）
+# 语义（借鉴点 38）= P(simple 档够用 | 当前分支)。非"判断置信度"。
+# 桥接 bandit Q_prior（借鉴点 2）时直接映射：conf 高 → simple 先验强。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_BRANCH_CONF = {
+    "override_complex": 0.05,   # R1 用户明说复杂
+    "override_simple": 0.95,    # R1 用户明说简单
+    "r0_context": 0.15,         # R0 上下文继承（延续上一轮 complex）
+    "r2_code_math": 0.10,       # R2 显式代码/数学信号
+    "r2_long_signal": 0.35,     # R2b 长+弱信号（可能是粘贴）
+    "r23_short": 0.95,          # R2.3 寒暄/致谢/短确认
+    "r24_mech": 0.90,           # R2.4 机械词 → simple 够用
+    "r3_complex": 0.25,         # R3 类型权重高（code_gen/analysis/debug）
+    "r3_simple": 0.80,          # R3 类型权重低（factual）
+    "r4_llm": 0.50,             # R4 LLM 兜底：LLM 结果不带置信度 → 中性
+    "no_user": 0.50,            # 无真实用户消息
+}
+
 # 短跟帖词表：上一轮 complex 时，含这些词的短句视为「延续上下文」而非新问题
 # （"解释一下" / "继续" / "为什么"…）。配合布尔 last_turn_complex，替代原来的
 # 衰减分数——不会再把"你是谁""hi"这类新问题误判成 complex。
@@ -131,19 +268,32 @@ def _is_followup(message: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4-layer routing engine
+# Routing engine — 8 branches, each returns (tier, branch_name)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def route(message: str, state: ConversationState) -> str:
-    """Return "simple" or "complex" — the model tier to use.
+def _route_with_branch(message: str, state: ConversationState):
+    """Return (tier, branch_name).
 
-    Layers:
-      R0: context inheritance — 短跟帖词 + 上一轮 complex → complex
-      R2: explicit complex signals — code, math, long messages → complex
-      R3: type weight — score-based threshold
-      R4: LLM fallback — 灰区才到这里
+    Branch order:
+      R1   user override（用户明说难易）→ 最强信号，先查
+      R0   context inheritance（上一轮 complex + 跟帖）
+      R2   explicit complex（code/math 需 length>20）
+      R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
+      R2.3 short confirm / greeting / thanks → simple
+      R2.4 mech layer（机械词 → simple，不调 LLM）
+      R2.5 no-type grey zone → llm
+      R3   type weight scoring
+      R4   grey zone → llm
     """
     f = extract_features(message)
+
+    # R1: 用户显式意图（借鉴点 26 — ThinkGate detectOverride）
+    # 用户自己说了难易 → 直接短路，跳过一切后续判断。
+    override = _detect_user_override(message)
+    if override == "complex":
+        return "complex", "override_complex"
+    if override == "simple":
+        return "simple", "override_simple"
 
     # R0: 上下文继承（布尔 last_turn_complex + 短跟帖词表）
     #
@@ -152,34 +302,60 @@ def route(message: str, state: ConversationState) -> str:
     # 布尔信号替代原来的衰减分数：同一条消息在任何 session 状态下结果一致，
     # 不会把"你是谁""hi"这类新问题误判成 complex。
     if state.last_turn_complex and (f["has_reference"] or _is_followup(message)):
-        return "complex"
+        return "complex", "r0_context"
 
     # R2: explicit complex signals — no LLM needed
-    if f["has_code"] or f["has_math"] or f["length"] > 200:
-        return "complex"
+    # 借鉴点 1+B6: code/math 还需 length>20，防 "pip install"/"import os" 这类
+    # 短代码也烧贵模型。
+    if (f["has_code"] or f["has_math"]) and f["length"] > 20:
+        return "complex", "r2_code_math"
 
-    # R2.3: 无明确类型的寒暄/致谢/极短句 → 直接 simple。
-    # 注意 type_matched 时不拦截（"代码"/"数学" 这类有类型信号的极短词
-    # 交给 R3 类型权重评分），否则 code_gen 权重 0.8 会被误降 simple。
-    if not f["type_matched"] and (
-            f["is_greeting"] or f["is_thanks"] or f["length"] <= 3):
-        return "simple"
+    # R2b: 长度不再单独定级（借鉴点 25 — ThinkGate "classify intent not length"）
+    # 长 + 带分析特征（代码/数学/类型命中）→ complex；纯长粘贴（日志/清单）→
+    # 继续往下走，最终落到 R3 factual → simple。
+    if f["length"] > 200 and (f["has_code"] or f["has_math"] or f["type_matched"]):
+        return "complex", "r2_long_signal"
+
+    # R2.3: 短确认/寒暄/致谢 → simple。
+    # 借鉴点 28: 整词表命中直接 simple（"好的！"/"ok?" 不再误判）；
+    # 查不到再退原条件。type_matched 时不拦截（"代码"/"数学" 这类有类型信号的
+    # 极短词交给 R3 类型权重评分），否则 code_gen 权重 0.8 会被误降 simple。
+    if _is_short_ack(message) or (
+            not f["type_matched"] and (
+                f["is_greeting"] or f["is_thanks"] or f["length"] <= 3)):
+        return "simple", "r23_short"
+
+    # R2.4: 机械层（借鉴点 21+27 — ThinkGate fastSignals）
+    # 明确机械活（翻译/润色/格式化/时间查询…）→ simple，不调 LLM。
+    # 带 code/math 信号时放过（可能是"翻译一下这段代码"）。
+    if _is_mech_simple(message) and not (f["has_code"] or f["has_math"]):
+        return "simple", "r24_mech"
 
     # R2.5: type not matched + non-trivial message → don't trust factual default
     # "factual" default (weight 0.2) would wrongly force simple.  Short messages
     # (≤10 chars) without keywords are likely trivial follow-ups and stay factual.
     if not f["type_matched"] and 10 < f["length"] <= 200:
-        return "llm"
+        return "llm", "r25_grey"
 
     # R3: 类型权重评分（去掉 complexity_score 融合，结果只依赖当前消息）
     type_weight = TYPE_WEIGHTS.get(f["question_type"], 0.3)
     if type_weight > 0.6:
-        return "complex"
+        return "complex", "r3_complex"
     elif type_weight < 0.3:
-        return "simple"
+        return "simple", "r3_simple"
 
     # R4: grey zone → LLM fallback (only ~20% of traffic)
-    return "llm"
+    return "llm", "r4_grey"
+
+
+def route(message: str, state: ConversationState) -> str:
+    """Return "simple" or "complex" — the model tier to use.
+
+    Backward-compatible shell over _route_with_branch(); classify() uses the
+    branch name for confidence lookup.
+    """
+    tier, _branch = _route_with_branch(message, state)
+    return tier
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -259,7 +435,8 @@ def classify(messages, classifier_cfg=None):
 
     Returns:
         {"complexity": "simple"|"complex", "task_type": "...",
-         "confidence": 0.0~1.0, "method": "rule"|"llm", "reasoning": "..."}
+         "confidence": 0.0~1.0, "method": "rule"|"llm", "reasoning": "...",
+         "cost_mode": "cheap"|"normal"}   # cost_mode 供 bandit 请求级 threshold 用
     """
     # Extract last user message.
     # Hermes 切换模型时会注入 role="user" 的元数据消息:
@@ -282,8 +459,9 @@ def classify(messages, classifier_cfg=None):
         # 只有注入消息、没有真实用户输入 → 默认放行，不用复杂模型
         return {
             "complexity": "simple", "task_type": "other",
-            "confidence": 0.5, "method": "rule",
+            "confidence": _BRANCH_CONF["no_user"], "method": "rule",
             "reasoning": "no real user message (system injection only)",
+            "cost_mode": "normal",
         }
 
     message = user_texts[-1]
@@ -291,7 +469,7 @@ def classify(messages, classifier_cfg=None):
     task_type = _task_type_from_features(f)
 
     state = get_state()
-    tier = route(message, state)
+    tier, branch = _route_with_branch(message, state)
 
     if tier == "llm":
         # R4: LLM fallback for grey-zone requests
@@ -303,19 +481,24 @@ def classify(messages, classifier_cfg=None):
         return {
             "complexity": tier,
             "task_type": task_type,
-            "confidence": 0.7,
+            "confidence": _BRANCH_CONF["r4_llm"],
             "method": "llm",
-            "reasoning": f"llm_fallback ({latency_ms}ms)",
+            "reasoning": f"llm_fallback ({branch}, {latency_ms}ms)",
+            "cost_mode": "normal",
         }
 
-    # R1/R2/R3: rule-based — no LLM call
-    confidence = _derive_confidence(f, tier)
+    # rule-based — no LLM call.  confidence 按分支查表（借鉴点 30）。
+    confidence = _BRANCH_CONF.get(branch, 0.5)
+    # 借鉴点 32: 用户明说"随便/省钱" → cost_mode="cheap"（本阶段仅透传，
+    # bandit 请求级 threshold 落地时再消费）。
+    cost_mode = "cheap" if branch == "override_simple" else "normal"
     return {
         "complexity": tier,
         "task_type": task_type,
         "confidence": confidence,
         "method": "rule",
-        "reasoning": _reasoning_from_features(f, tier),
+        "reasoning": _reasoning_from_features(f, tier, branch),
+        "cost_mode": cost_mode,
     }
 
 
@@ -335,20 +518,11 @@ def _task_type_from_features(f: dict) -> str:
     return mapping.get(f["question_type"], "other")
 
 
-def _derive_confidence(f: dict, tier: str) -> float:
-    """Confidence based on which signals fired."""
-    if f["has_code"] or f["has_math"]:
-        return 0.9
-    if f["is_ellipsis"]:
-        return 0.8
-    if f["has_reference"]:
-        return 0.85
-    return 0.7
-
-
-def _reasoning_from_features(f: dict, tier: str) -> str:
+def _reasoning_from_features(f: dict, tier: str, branch: str = "") -> str:
     """Human-readable reasoning string for logging."""
     parts = []
+    if branch:
+        parts.append(branch)
     if f["has_code"]:
         parts.append("has_code")
     if f["has_math"]:
