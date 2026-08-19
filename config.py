@@ -18,6 +18,8 @@ import json
 import os
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ── 模块级缓存 ─────────────────────────────────────────────────────────
@@ -360,6 +362,89 @@ def _save_fetch_cache(cache: dict) -> None:
         pass  # 缓存写失败只影响性能，不影响正确性
 
 
+# ── 来源二网络 fetch：并发 + 后台化 ─────────────────────────────────────
+# 实测：白名单模型在来源一（静态列表）已 100% 覆盖 endpoint，来源二的
+# 网络 fetch 只用于「补 fallback 端点」——不值得让新用户第一次启动
+# 干等 N×8s 串行超时。因此：
+#   - 静态部分（fallback_models + 磁盘缓存命中）同步立即合并
+#   - 网络部分并发拉取；background=True 时放后台 daemon 线程，拉完
+#     只写磁盘缓存（下次启动命中），主路径零网络阻塞
+#   - force 调试（background=False）保持同步语义：拉完立即合并
+_BG_LOCK = threading.Lock()
+_BG_RUNNING = False
+
+
+def _fetch_one(base: str, key_val: str, prof) -> tuple:
+    """对单个 provider 拉取模型列表。返回 (base, [model_id, ...])。"""
+    models = []
+    fn = getattr(prof, "fetch_models", None)
+    if callable(fn):
+        try:
+            fetched = fn(api_key=key_val, base_url=base, timeout=8.0) or []
+        except Exception:
+            fetched = []
+        models = [m for m in fetched if isinstance(m, str)]
+    if not models:
+        # 兜底：自定义 fetch 没出模型时主动调 /models
+        models = _fetch_models(base, key_val)
+    return base, models
+
+
+def _fetch_pending(pending, key, disk_cache: dict, write_cache: bool = True) -> dict:
+    """并发拉取 pending=[(prof, base, key_val), ...]，返回 {base: [models]}。
+
+    write_cache=True 时把结果合并写回磁盘缓存（原子写，失败静默降级）。
+    """
+    results = {}
+    if not pending:
+        return results
+    workers = min(4, len(pending))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_fetch_one, base, kv, prof) for (prof, base, kv) in pending]
+        for fut in as_completed(futs):
+            try:
+                base, models = fut.result()
+            except Exception:
+                continue
+            if models:
+                results[base] = models
+    if write_cache and key is not None and results:
+        merged = dict(disk_cache.get("fetched", {}) or {})
+        merged.update(results)
+        _save_fetch_cache({"key": list(key), "fetched": merged})
+    return results
+
+
+def _background_fetch_worker(pending, key, disk_cache: dict) -> None:
+    global _BG_RUNNING
+    try:
+        results = _fetch_pending(pending, key, disk_cache, write_cache=False)
+        # 拉取期间配置可能已变更：key 失配则丢弃结果，避免污染新配置的缓存
+        if results and key is not None:
+            cur_key = (_mtime(_config_path()), _mtime(_hermes_home() / ".env"))
+            if list(cur_key) == list(key):
+                merged = dict(disk_cache.get("fetched", {}) or {})
+                merged.update(results)
+                _save_fetch_cache({"key": list(key), "fetched": merged})
+    finally:
+        with _BG_LOCK:
+            _BG_RUNNING = False
+
+
+def _start_background_fetch(pending, key, disk_cache: dict) -> None:
+    """起一个 daemon 后台线程拉取；已有后台任务在跑则跳过（防重复）。"""
+    global _BG_RUNNING
+    with _BG_LOCK:
+        if _BG_RUNNING or not pending:
+            return
+        _BG_RUNNING = True
+    threading.Thread(
+        target=_background_fetch_worker,
+        args=(pending, key, disk_cache),
+        daemon=True,
+    ).start()
+
+
 # ── provider 发现 ───────────────────────────────────────────────────────
 # 非 OpenAI 兼容的 api_mode —— 调 /models 会失败或格式不对，直接跳过
 _SKIP_API_MODES = {"anthropic_messages", "bedrock_converse", "codex_responses", "copilot_acp"}
@@ -408,7 +493,8 @@ def _iter_custom_providers(data: dict):
         yield cp
 
 
-def _scan_provider_plugins(add_model, use_disk_cache: bool = True) -> None:
+def _scan_provider_plugins(add_model, use_disk_cache: bool = True,
+                           background: bool = True) -> None:
     """扫描 Hermes provider 注册表。打包环境 import 失败时静默跳过。
 
     对每个有 base_url + 已配 key 的 OpenAI 兼容 provider：
@@ -418,6 +504,11 @@ def _scan_provider_plugins(add_model, use_disk_cache: bool = True) -> None:
     mtime 落盘缓存（data/fetch_cache.json，不含 api_key），跨进程命中
     缓存则零网络调用——每次开 app 不再重复扫模型列表。
     use_disk_cache=False（force 调试/手动刷新）：总是调 API，不读写缓存。
+
+    background=True（正常路径）：网络 fetch 放后台 daemon 线程并发执行，
+    主路径立即返回（白名单模型在来源一已有 endpoint 可用，来源二只补
+    fallback 端点，不值得阻塞启动）；拉完写磁盘缓存，下次启动命中。
+    background=False（force 调试）：同步并发拉取并立即合并。
     """
     # 非 OpenAI 兼容的 api_mode —— 调 /models 会失败或格式不对，直接跳过
     _SKIP_API_MODES = {"anthropic_messages", "bedrock_converse", "codex_responses", "copilot_acp"}
@@ -440,8 +531,8 @@ def _scan_provider_plugins(add_model, use_disk_cache: bool = True) -> None:
         key = (_mtime(_config_path()), _mtime(_hermes_home() / ".env"))
         if disk_cache.get("key") == list(key):
             cached = disk_cache.get("fetched", {}) or {}
-    fetched_now = {}
 
+    pending = []  # 需要网络拉取的: [(prof, base, key_val), ...]
     for prof in profiles:
         base = getattr(prof, "base_url", "") or ""
         if not base or not base.startswith("http"):
@@ -453,44 +544,38 @@ def _scan_provider_plugins(add_model, use_disk_cache: bool = True) -> None:
             key_val = get_api_key(env)
             if not key_val:
                 continue
+            # 静态部分（fallback_models + 缓存命中）同步立即合并
             models = list(getattr(prof, "fallback_models", ()) or ())
             cache_hit = cached.get(base)
             if cache_hit:
-                # 缓存命中：跳过网络 fetch，直接合并缓存列表
                 models.extend(cache_hit)
             else:
-                fn = getattr(prof, "fetch_models", None)
-                if callable(fn):
-                    try:
-                        fetched = fn(api_key=key_val, base_url=base, timeout=8.0) or []
-                    except Exception:
-                        fetched = []
-                    if fetched:
-                        fetched_now[base] = fetched
-                    for m in fetched:
-                        if m not in models:
-                            models.append(m)
-                # ★ 兜底：fallback_models 和 fetch_models 都没出模型时，主动调 /models
-                if not models:
-                    models = _fetch_models(base, key_val)
-                    if models:
-                        fetched_now[base] = models
+                pending.append((prof, base, key_val))
             for m in models:
                 add_model(m, base, key_val)
             break  # 一个 provider 取一个已配 key 即可
 
-    # ── 写回磁盘缓存（只缓存真实网络 fetch 的结果）──
-    if use_disk_cache and fetched_now and key is not None:
-        merged = dict(disk_cache.get("fetched", {}) or {})
-        merged.update(fetched_now)
-        _save_fetch_cache({"key": list(key), "fetched": merged})
+    if not pending:
+        return
+    if background:
+        # 后台拉取：主路径不阻塞，拉完只写磁盘缓存（本次进程内不合并）
+        _start_background_fetch(pending, key, disk_cache)
+    else:
+        # 同步拉取（force 调试）：并发 + 立即合并
+        results = _fetch_pending(pending, key, disk_cache, write_cache=True)
+        for prof, base, key_val in pending:
+            for m in results.get(base, []):
+                add_model(m, base, key_val)
 
 
-def _discover_provider_models(data: dict, use_disk_cache: bool = True) -> dict:
+def _discover_provider_models(data: dict, use_disk_cache: bool = True,
+                              background: bool = True) -> dict:
     """扫描所有 provider 来源，返回 {model_name: [{base_url, api_key}, ...]}。
 
     同一模型可挂多个 endpoint（按顺序 fallback）。全程不打印 key 值。
     use_disk_cache=False（force 调试）时来源二不读/不写磁盘缓存。
+    background=True（正常路径）时来源二的网络 fetch 放后台线程，
+    主路径零网络阻塞；False（force 调试）时同步拉取立即合并。
     """
     discovered = {}
 
@@ -521,7 +606,8 @@ def _discover_provider_models(data: dict, use_disk_cache: bool = True) -> dict:
             add_model(m, base_url, api_key)
 
     # 来源二：Hermes provider 注册表（app 里配的标准 provider）
-    _scan_provider_plugins(add_model, use_disk_cache=use_disk_cache)
+    _scan_provider_plugins(add_model, use_disk_cache=use_disk_cache,
+                           background=background)
 
     return discovered
 
@@ -608,8 +694,9 @@ def load_router_config(force: bool = False) -> dict:
             return {}
 
     # 发现 + 过滤 + 分类
-    # force=True 时来源二跳过磁盘缓存（调试/手动刷新语义）
-    discovered = _discover_provider_models(data, use_disk_cache=not force)
+    # force=True 时来源二跳过磁盘缓存且同步拉取（调试/手动刷新语义）
+    discovered = _discover_provider_models(data, use_disk_cache=not force,
+                                           background=not force)
     simple = set()
     complex_ = set()
     for m in discovered:
