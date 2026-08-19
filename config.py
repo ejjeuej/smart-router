@@ -14,6 +14,7 @@
 安全约定：日志绝不打印 key 值。
 """
 
+import json
 import os
 import re
 import sys
@@ -337,6 +338,28 @@ def _fetch_models(base_url: str, api_key: str) -> list:
         return []
 
 
+# ── fetch 结果磁盘缓存（跨进程）──────────────────────────────────────────
+# 进程内 _FETCHED_MODELS_CACHE 在每次开 app（新进程）时清零，来源二
+# `_scan_provider_plugins` 会对每个已配 key 的 provider 重新调
+# fetch_models//models（网络，单次可达 6~8s 超时）。这里把 fetch 结果按
+# (config.yaml, .env) mtime 落盘，命中缓存则零网络调用。
+# 缓存文件不含 api_key（只存 base_url → 模型名），与 .env 同权限。
+def _fetch_cache_path() -> Path:
+    return Path(__file__).resolve().parent / "data" / "fetch_cache.json"
+
+
+def _save_fetch_cache(cache: dict) -> None:
+    try:
+        path = _fetch_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        tmp.replace(path)
+    except Exception:
+        pass  # 缓存写失败只影响性能，不影响正确性
+
+
 # ── provider 发现 ───────────────────────────────────────────────────────
 # 非 OpenAI 兼容的 api_mode —— 调 /models 会失败或格式不对，直接跳过
 _SKIP_API_MODES = {"anthropic_messages", "bedrock_converse", "codex_responses", "copilot_acp"}
@@ -385,11 +408,16 @@ def _iter_custom_providers(data: dict):
         yield cp
 
 
-def _scan_provider_plugins(add_model) -> None:
+def _scan_provider_plugins(add_model, use_disk_cache: bool = True) -> None:
     """扫描 Hermes provider 注册表。打包环境 import 失败时静默跳过。
 
     对每个有 base_url + 已配 key 的 OpenAI 兼容 provider：
     优先用 fallback_models / fetch_models；都没有则主动调 /models 拉取。
+
+    use_disk_cache=True（正常路径）：fetch 结果按 (config.yaml, .env)
+    mtime 落盘缓存（data/fetch_cache.json，不含 api_key），跨进程命中
+    缓存则零网络调用——每次开 app 不再重复扫模型列表。
+    use_disk_cache=False（force 调试/手动刷新）：总是调 API，不读写缓存。
     """
     # 非 OpenAI 兼容的 api_mode —— 调 /models 会失败或格式不对，直接跳过
     _SKIP_API_MODES = {"anthropic_messages", "bedrock_converse", "codex_responses", "copilot_acp"}
@@ -398,6 +426,22 @@ def _scan_provider_plugins(add_model) -> None:
         profiles = list_providers()
     except Exception:
         return
+
+    # ── 磁盘缓存：key = (config.yaml mtime, .env mtime)，变了才重扫 ──
+    key = None
+    cached = {}
+    disk_cache = {}
+    if use_disk_cache:
+        try:
+            with open(_fetch_cache_path(), encoding="utf-8") as f:
+                disk_cache = json.load(f) or {}
+        except Exception:
+            disk_cache = {}
+        key = (_mtime(_config_path()), _mtime(_hermes_home() / ".env"))
+        if disk_cache.get("key") == list(key):
+            cached = disk_cache.get("fetched", {}) or {}
+    fetched_now = {}
+
     for prof in profiles:
         base = getattr(prof, "base_url", "") or ""
         if not base or not base.startswith("http"):
@@ -406,31 +450,47 @@ def _scan_provider_plugins(add_model) -> None:
         if api_mode in _SKIP_API_MODES:
             continue
         for env in (getattr(prof, "env_vars", ()) or ()):
-            key = get_api_key(env)
-            if not key:
+            key_val = get_api_key(env)
+            if not key_val:
                 continue
             models = list(getattr(prof, "fallback_models", ()) or ())
-            fn = getattr(prof, "fetch_models", None)
-            if callable(fn):
-                try:
-                    fetched = fn(api_key=key, base_url=base, timeout=8.0) or []
-                except Exception:
-                    fetched = []
-                for m in fetched:
-                    if m not in models:
-                        models.append(m)
-            # ★ 兜底：fallback_models 和 fetch_models 都没出模型时，主动调 /models
-            if not models:
-                models = _fetch_models(base, key)
+            cache_hit = cached.get(base)
+            if cache_hit:
+                # 缓存命中：跳过网络 fetch，直接合并缓存列表
+                models.extend(cache_hit)
+            else:
+                fn = getattr(prof, "fetch_models", None)
+                if callable(fn):
+                    try:
+                        fetched = fn(api_key=key_val, base_url=base, timeout=8.0) or []
+                    except Exception:
+                        fetched = []
+                    if fetched:
+                        fetched_now[base] = fetched
+                    for m in fetched:
+                        if m not in models:
+                            models.append(m)
+                # ★ 兜底：fallback_models 和 fetch_models 都没出模型时，主动调 /models
+                if not models:
+                    models = _fetch_models(base, key_val)
+                    if models:
+                        fetched_now[base] = models
             for m in models:
-                add_model(m, base, key)
+                add_model(m, base, key_val)
             break  # 一个 provider 取一个已配 key 即可
 
+    # ── 写回磁盘缓存（只缓存真实网络 fetch 的结果）──
+    if use_disk_cache and fetched_now and key is not None:
+        merged = dict(disk_cache.get("fetched", {}) or {})
+        merged.update(fetched_now)
+        _save_fetch_cache({"key": list(key), "fetched": merged})
 
-def _discover_provider_models(data: dict) -> dict:
+
+def _discover_provider_models(data: dict, use_disk_cache: bool = True) -> dict:
     """扫描所有 provider 来源，返回 {model_name: [{base_url, api_key}, ...]}。
 
     同一模型可挂多个 endpoint（按顺序 fallback）。全程不打印 key 值。
+    use_disk_cache=False（force 调试）时来源二不读/不写磁盘缓存。
     """
     discovered = {}
 
@@ -461,7 +521,7 @@ def _discover_provider_models(data: dict) -> dict:
             add_model(m, base_url, api_key)
 
     # 来源二：Hermes provider 注册表（app 里配的标准 provider）
-    _scan_provider_plugins(add_model)
+    _scan_provider_plugins(add_model, use_disk_cache=use_disk_cache)
 
     return discovered
 
@@ -548,7 +608,8 @@ def load_router_config(force: bool = False) -> dict:
             return {}
 
     # 发现 + 过滤 + 分类
-    discovered = _discover_provider_models(data)
+    # force=True 时来源二跳过磁盘缓存（调试/手动刷新语义）
+    discovered = _discover_provider_models(data, use_disk_cache=not force)
     simple = set()
     complex_ = set()
     for m in discovered:
