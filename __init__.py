@@ -184,6 +184,37 @@ def _inject_tier_hint(request: dict, tier: str) -> dict:
         return request
 
 
+# ── 思考参数补注 ──────────────────────────────────────────────────────
+# Hermes 的 thinking 注入发生在 transport 层 build_kwargs（中间件之后）：
+# 主循环默认 reasoning_config = {enabled: true, effort: medium}，到 transport
+# 才转成 enable_thinking / extra_body.thinking 等 wire 参数。插件 llm_execution
+# 中间件自己直连上游，把这个注入绕过了 → 上游默认不开思考 → 响应没有
+# reasoning_content → 前端不显示思考过程（即使"透传"也无效，因为请求里
+# 根本没有这个字段）。
+# 修复：转发时对支持思考的模型主动补 enable_thinking: true（百炼/OpenAI
+# 兼容模式的统一思考开关）。request 里已有 thinking 相关字段则透传不动
+# （尊重 Hermes /thinkon /thinkoff 与 reasoning_effort 等显式设置）。
+_THINKING_CTL_KEYS = (
+    "enable_thinking", "thinking", "thinking_config",
+    "reasoning_effort", "reasoning", "extra_body",
+)
+
+
+def _ensure_thinking(modified: dict, model: str) -> dict:
+    """确保转发请求携带思考开关（对齐 Hermes transport 层的默认注入）。"""
+    try:
+        if any(k in modified for k in _THINKING_CTL_KEYS):
+            return modified  # 已有显式控制，透传不动
+        low = str(model or "").lower()
+        if low.startswith(("qwen", "qwq", "deepseek")):
+            m = dict(modified)
+            m["enable_thinking"] = True
+            return m
+    except Exception:
+        pass
+    return modified
+
+
 def on_llm_execution(request, next_call, **context):
     global _last_routed
     cfg = load_router_config()
@@ -203,8 +234,9 @@ def on_llm_execution(request, next_call, **context):
                 modified["model"] = _last_routed["model"]
                 modified.pop("stream", None)
                 modified.pop("stream_options", None)
-                # 透传 enable_thinking：思考开关是 Hermes/模型的决定，
-                # 插件不替用户关掉（否则思考过程文字消失）。
+                # Hermes 的 thinking 注入在 transport 层被插件绕过，
+                # 这里补注 enable_thinking（qwen/deepseek 系默认开思考）
+                modified = _ensure_thinking(modified, _last_routed["model"])
                 _t_call = time.monotonic()
                 response = client.chat.completions.create(**modified)
                 _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
@@ -347,7 +379,9 @@ def on_llm_execution(request, next_call, **context):
                     modified["model"] = selected["model"]
                     modified.pop("stream", None)
                     modified.pop("stream_options", None)
-                    # 透传 enable_thinking（思考开关归 Hermes/模型管，插件不动）
+                    # Hermes 的 thinking 注入在 transport 层被插件绕过，
+                    # 这里补注 enable_thinking（qwen/deepseek 系默认开思考）
+                    modified = _ensure_thinking(modified, selected["model"])
                     # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
                     modified = _inject_tier_hint(
                         modified, "complex" if pool_key == "complex_models" else "simple")
@@ -444,7 +478,9 @@ def on_llm_execution(request, next_call, **context):
             modified["model"] = c["model"]
             modified.pop("stream", None)
             modified.pop("stream_options", None)
-            # 透传 enable_thinking（思考开关归 Hermes/模型管，插件不动）
+            # Hermes 的 thinking 注入在 transport 层被插件绕过，
+            # 这里补注 enable_thinking（qwen/deepseek 系默认开思考）
+            modified = _ensure_thinking(modified, c["model"])
             # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
             modified = _inject_tier_hint(
                 modified, "complex" if pool_key == "complex_models" else "simple")
