@@ -21,7 +21,8 @@ from pathlib import Path
 
 # ── 模块级缓存 ─────────────────────────────────────────────────────────
 _FETCHED_MODELS_CACHE = {}   # base_url → [model_id, ...]
-_ENV_FILE_CACHE = None       # ~/.hermes/.env 解析结果
+_ENV_FILE_CACHE = {}         # <home>/.env 解析结果 {KEY: value}
+_ENV_FILE_CACHE_KEY = None   # <home>/.env mtime 缓存键（None=从未读过）
 _ROUTER_CACHE = None
 _ROUTER_CACHE_KEY = None
 
@@ -264,22 +265,36 @@ def _load_yaml() -> dict:
 
 
 def _load_env_file() -> dict:
-    """解析 ~/.hermes/.env → {KEY: value}（仅内存，绝不打印值）。"""
-    global _ENV_FILE_CACHE
-    if _ENV_FILE_CACHE is None:
-        _ENV_FILE_CACHE = {}
-        try:
-            with open(_hermes_home() / ".env", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, _, v = line.partition("=")
-                    k, v = k.strip(), v.strip().strip('"').strip("'")
-                    if k and v:
-                        _ENV_FILE_CACHE[k] = v
-        except Exception:
-            pass
+    """解析 <home>/.env → {KEY: value}（仅内存，绝不打印值）。
+
+    带 mtime 缓存：.env 文件内容变化后自动重读，改 key 无需重启进程。
+    与 load_router_config 的 cache_key 联动——.env 的 mtime 变了会触发
+    重扫，本函数必须同步返回新 key，否则会拿到旧值（旧 bug）。
+    文件不存在视为「空配置」缓存（文件出现时 mtime 变化自动失效）；
+    读取失败不更新缓存键，下次调用会重试（与 _load_yaml 语义一致）。
+    """
+    global _ENV_FILE_CACHE, _ENV_FILE_CACHE_KEY
+    env_path = _hermes_home() / ".env"
+    key = _mtime(env_path)
+    if _ENV_FILE_CACHE_KEY == key:
+        return _ENV_FILE_CACHE
+    cache = {}
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and v:
+                    cache[k] = v
+        _ENV_FILE_CACHE, _ENV_FILE_CACHE_KEY = cache, key
+    except FileNotFoundError:
+        # .env 不存在：缓存空结果，避免每次调用都重试 open
+        _ENV_FILE_CACHE, _ENV_FILE_CACHE_KEY = {}, key
+    except Exception:
+        pass  # 其他读取失败：保持旧缓存键，下次重试
     return _ENV_FILE_CACHE
 
 
