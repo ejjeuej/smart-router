@@ -128,8 +128,8 @@ def _annotate_response(response, cfg, model_routed, complexity, task_type,
     """在回复末尾追加路由脚注，让用户在对话界面直接看到路由结果。
 
     开关：config.yaml smart_model_routing.announce（默认 true）。
-    仅注入有文本内容的成功响应；tool 续调/无文本响应不注入。
-    任何异常静默跳过（print stderr），绝不影响路由主流程。
+    仅注入有文本内容的成功响应；纯 tool_calls（无文本）不注入。
+    主路径与 tool 续调路径都会调用；任何异常静默跳过，绝不影响路由主流程。
     """
     try:
         if not cfg.get("announce", True):
@@ -203,8 +203,18 @@ def on_llm_execution(request, next_call, **context):
                 modified["model"] = _last_routed["model"]
                 modified.pop("stream", None)
                 modified.pop("stream_options", None)
-                modified.pop("enable_thinking", None)
-                return client.chat.completions.create(**modified)
+                # 透传 enable_thinking：思考开关是 Hermes/模型的决定，
+                # 插件不替用户关掉（否则思考过程文字消失）。
+                _t_call = time.monotonic()
+                response = client.chat.completions.create(**modified)
+                _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
+                return _annotate_response(
+                    response, cfg, _last_routed["model"],
+                    _last_routed.get("complexity", "?"),
+                    _last_routed.get("task_type", "?"),
+                    _last_routed.get("method", "?"),
+                    _latency_call_ms,
+                    _last_routed.get("pool_key", "simple_models"))
             except Exception:
                 pass
         return _safe_pass_through(request, next_call)
@@ -337,7 +347,7 @@ def on_llm_execution(request, next_call, **context):
                     modified["model"] = selected["model"]
                     modified.pop("stream", None)
                     modified.pop("stream_options", None)
-                    modified.pop("enable_thinking", None)
+                    # 透传 enable_thinking（思考开关归 Hermes/模型管，插件不动）
                     # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
                     modified = _inject_tier_hint(
                         modified, "complex" if pool_key == "complex_models" else "simple")
@@ -370,7 +380,11 @@ def on_llm_execution(request, next_call, **context):
 
                     _last_routed = {"model": selected["model"],
                                     "base_url": selected["base_url"],
-                                    "api_key": selected["api_key"]}
+                                    "api_key": selected["api_key"],
+                                    "complexity": complexity,
+                                    "task_type": task_type,
+                                    "method": method,
+                                    "pool_key": pool_key}
                     return _annotate_response(
                         response, cfg, selected["model"], complexity,
                         task_type, method, latency_ms, pool_key)
@@ -430,7 +444,7 @@ def on_llm_execution(request, next_call, **context):
             modified["model"] = c["model"]
             modified.pop("stream", None)
             modified.pop("stream_options", None)
-            modified.pop("enable_thinking", None)
+            # 透传 enable_thinking（思考开关归 Hermes/模型管，插件不动）
             # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
             modified = _inject_tier_hint(
                 modified, "complex" if pool_key == "complex_models" else "simple")
@@ -462,7 +476,11 @@ def on_llm_execution(request, next_call, **context):
             )
 
             _last_routed = {"model": c["model"], "base_url": c["base_url"],
-                            "api_key": c["api_key"]}
+                            "api_key": c["api_key"],
+                            "complexity": complexity,
+                            "task_type": task_type,
+                            "method": method,
+                            "pool_key": pool_key}
             return _annotate_response(
                 response, cfg, c["model"], complexity,
                 task_type, method, latency_ms, pool_key)
