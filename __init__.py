@@ -191,24 +191,63 @@ def _inject_tier_hint(request: dict, tier: str) -> dict:
 # 中间件自己直连上游，把这个注入绕过了 → 上游默认不开思考 → 响应没有
 # reasoning_content → 前端不显示思考过程（即使"透传"也无效，因为请求里
 # 根本没有这个字段）。
-# 修复：转发时对支持思考的模型主动补 enable_thinking: true（百炼/OpenAI
-# 兼容模式的统一思考开关）。request 里已有 thinking 相关字段则透传不动
-# （尊重 Hermes /thinkon /thinkoff 与 reasoning_effort 等显式设置）。
+# 修复：转发时对"能思考的模型"主动补开思考的 wire 参数。判断分两层：
+#   ① 模型家族 —— 所有已知默认支持思考的家族（qwen/glm/kimi/deepseek/
+#      o 系/claude/gemini…），与 config.py 的 _FAMILY_TIER（复杂度分级）
+#      是两个独立维度：simple 池的 glm-5.2-fast-preview 同样能思考。
+#   ② 上游平台 —— 决定参数名：智谱/Kimi 官方接口用 thinking，
+#      百炼/OpenAI 兼容统一用 enable_thinking。
+# request 里已有 thinking 相关字段则透传不动（尊重 Hermes /thinkon
+# /thinkoff 与 reasoning_effort 等显式设置）。
 _THINKING_CTL_KEYS = (
     "enable_thinking", "thinking", "thinking_config",
     "reasoning_effort", "reasoning", "extra_body",
 )
 
+# 已知"默认支持思考"的模型家族（启发式，按模型名子串匹配，防厂商前缀
+# 如 zhipu-glm4 / alibaba-qwen 与日期后缀如 -2026-02-23 的干扰）。
+# 命中 → 请求里无 thinking 控制键时主动补开思考参数。
+_THINKING_FAMILIES = (
+    # 阿里 / 通义（百炼 enable_thinking）
+    "qwen", "qwq", "qvq",
+    # DeepSeek（reasoner 系默认思考；v3/v4 系可开）
+    "deepseek",
+    # 智谱 GLM（z1/5 系思考，官方接口参数 thinking）
+    "glm", "zhipu",
+    # Kimi / Moonshot（K2 系思考，官方接口参数 thinking）
+    "kimi", "moonshot",
+    # OpenAI o 系 / gpt-5（reasoning_effort，通常已由 Hermes 显式携带）
+    "o1", "o3", "o4", "gpt-5",
+    # Anthropic（extra_body.thinking）
+    "claude",
+    # Google（thinking_config）
+    "gemini",
+)
 
-def _ensure_thinking(modified: dict, model: str) -> dict:
+
+def _thinking_params_for(model: str, base_url: str) -> dict:
+    """按模型家族 + 上游平台返回应补的思考开关参数（不适用则空 dict）。"""
+    low = str(model or "").lower()
+    if not any(f in low for f in _THINKING_FAMILIES) \
+            and "thinking" not in low and "reasoner" not in low:
+        return {}  # 非思考系家族，不补（避免不支持参数的上游 400）
+    url = str(base_url or "").lower()
+    # 平台专用参数名：智谱官方 / Kimi 官方用 thinking；
+    # 百炼/OpenAI 兼容统一用 enable_thinking（未知平台按 OpenAI 兼容处理）。
+    if "open.bigmodel.cn" in url or "moonshot.cn" in url:
+        return {"thinking": True}
+    return {"enable_thinking": True}
+
+
+def _ensure_thinking(modified: dict, model: str, base_url: str = "") -> dict:
     """确保转发请求携带思考开关（对齐 Hermes transport 层的默认注入）。"""
     try:
         if any(k in modified for k in _THINKING_CTL_KEYS):
             return modified  # 已有显式控制，透传不动
-        low = str(model or "").lower()
-        if low.startswith(("qwen", "qwq", "deepseek")):
+        params = _thinking_params_for(model, base_url)
+        if params:
             m = dict(modified)
-            m["enable_thinking"] = True
+            m.update(params)
             return m
     except Exception:
         pass
@@ -235,8 +274,9 @@ def on_llm_execution(request, next_call, **context):
                 modified.pop("stream", None)
                 modified.pop("stream_options", None)
                 # Hermes 的 thinking 注入在 transport 层被插件绕过，
-                # 这里补注 enable_thinking（qwen/deepseek 系默认开思考）
-                modified = _ensure_thinking(modified, _last_routed["model"])
+                # 这里按模型家族+平台补注思考开关（qwen/glm/kimi/deepseek 等）
+                modified = _ensure_thinking(
+                    modified, _last_routed["model"], _last_routed["base_url"])
                 _t_call = time.monotonic()
                 response = client.chat.completions.create(**modified)
                 _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
@@ -380,8 +420,9 @@ def on_llm_execution(request, next_call, **context):
                     modified.pop("stream", None)
                     modified.pop("stream_options", None)
                     # Hermes 的 thinking 注入在 transport 层被插件绕过，
-                    # 这里补注 enable_thinking（qwen/deepseek 系默认开思考）
-                    modified = _ensure_thinking(modified, selected["model"])
+                    # 这里按模型家族+平台补注思考开关（qwen/glm/kimi/deepseek 等）
+                    modified = _ensure_thinking(
+                        modified, selected["model"], selected["base_url"])
                     # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
                     modified = _inject_tier_hint(
                         modified, "complex" if pool_key == "complex_models" else "simple")
@@ -479,8 +520,9 @@ def on_llm_execution(request, next_call, **context):
             modified.pop("stream", None)
             modified.pop("stream_options", None)
             # Hermes 的 thinking 注入在 transport 层被插件绕过，
-            # 这里补注 enable_thinking（qwen/deepseek 系默认开思考）
-            modified = _ensure_thinking(modified, c["model"])
+            # 这里按模型家族+平台补注思考开关（qwen/glm/kimi/deepseek 等）
+            modified = _ensure_thinking(
+                modified, c["model"], c["base_url"])
             # 借鉴点 22: 档位感知提示（给 LLM 看，与 announce 分离）
             modified = _inject_tier_hint(
                 modified, "complex" if pool_key == "complex_models" else "simple")
