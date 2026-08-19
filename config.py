@@ -203,11 +203,14 @@ def _hermes_home() -> Path:
 
     解析顺序：
       1. HERMES_HOME 环境变量（Hermes 主程序显式指定，profile/自定义部署）
-      2. Windows 桌面打包版：%LOCALAPPDATA%\\hermes
-         Sinoregal Agent 打包版把平台默认 home 放在这里，且**不设置**
-         HERMES_HOME 环境变量（主程序内部默认路径已被改掉，但插件是
-         独立代码看不到），只能靠探测：该目录存在即视为 home。
+      2. Windows 桌面打包版（按品牌优先级探测）：
+         - Sinoregal Agent（新版）：%LOCALAPPDATA%\\sinoregal
+         - 旧版 hermes-desktop：    %LOCALAPPDATA%\\hermes
+         Sinoregal Agent 把数据目录改名 sinoregal 以避免和旧 hermes 安装
+         冲突，且**不设置** HERMES_HOME 环境变量（主程序内部默认路径已改，
+         但插件是独立代码看不到），只能靠探测：目录存在即视为 home。
          这也是 .env / config.yaml / plugins 实际所在的位置。
+         两个目录都探测，优先 sinoregal（新版），找不到才退回 hermes（旧版兼容）。
       3. 原版默认 ~/.hermes（NousResearch hermes / POSIX 部署）
     """
     env = os.environ.get("HERMES_HOME", "").strip()
@@ -216,12 +219,14 @@ def _hermes_home() -> Path:
     if os.name == "nt":
         local = os.environ.get("LOCALAPPDATA", "").strip()
         if local:
-            candidate = Path(local) / "hermes"
-            try:
-                if candidate.is_dir():
-                    return candidate
-            except OSError:
-                pass
+            # Sinoregal Agent 打包版（新）→ 旧 hermes-desktop 打包版（兜底）
+            for name in ("sinoregal", "hermes"):
+                candidate = Path(local) / name
+                try:
+                    if candidate.is_dir():
+                        return candidate
+                except OSError:
+                    pass
     return Path.home() / ".hermes"
 
 
@@ -306,6 +311,10 @@ def _fetch_models(base_url: str, api_key: str) -> list:
 
 
 # ── provider 发现 ───────────────────────────────────────────────────────
+# 非 OpenAI 兼容的 api_mode —— 调 /models 会失败或格式不对，直接跳过
+_SKIP_API_MODES = {"anthropic_messages", "bedrock_converse", "codex_responses", "copilot_acp"}
+
+
 def _resolve_key(cp: dict) -> str:
     """从 provider 条目解析 api_key：内联 api_key 优先，其次 api_key_env。"""
     raw = cp.get("api_key") or cp.get("key")
@@ -321,13 +330,32 @@ def _resolve_key(cp: dict) -> str:
 
 
 def _iter_custom_providers(data: dict):
-    """统一读取 custom_providers（list 或 keyed dict 两种格式）。"""
+    """统一读取 custom_providers（list 或 keyed dict 两种格式）。
+
+    兼容两种落点：
+      1. 旧版/插件自举:顶层 custom_providers 段（list 或 keyed dict）
+      2. App 界面配置:providers.<name> 段（dict，含 base_url/key_env/models）——
+         主程序「自定义模型端点」写在这里，custom_providers 段可能为空或缺失。
+    """
     cps = data.get("custom_providers", [])
     if isinstance(cps, dict):
         cps = list(cps.values())
     for cp in (cps or []):
         if isinstance(cp, dict):
             yield cp
+    # App 界面「自定义模型端点」的落点: providers.<name>（name/base_url/key_env/models）
+    for name, pv in (data.get("providers") or {}).items():
+        if not isinstance(pv, dict):
+            continue
+        base_url = pv.get("base_url", "") or ""
+        if not base_url.startswith("http"):
+            continue
+        api_mode = pv.get("api_mode", "") or ""
+        if api_mode in _SKIP_API_MODES:
+            continue
+        cp = dict(pv)
+        cp.setdefault("name", name)
+        yield cp
 
 
 def _scan_provider_plugins(add_model) -> None:
@@ -394,6 +422,9 @@ def _discover_provider_models(data: dict) -> dict:
         if not base_url or not api_key:
             continue
         models = cp.get("models") or cp.get("model") or []
+        if isinstance(models, dict):
+            # App 界面格式: models: {模型名: {...配置...}} → 取 keys
+            models = list(models.keys())
         if isinstance(models, str):
             models = [models]
         models = [m for m in models if isinstance(m, str)]

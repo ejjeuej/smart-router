@@ -23,3 +23,6 @@ Thumbs.db
 # 环境与密钥
 .env
 *.env
+
+# 旧脚本归档（本地备份，不进版本库）
+scripts/legacy/
