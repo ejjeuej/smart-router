@@ -62,6 +62,9 @@ LAMBDA_MAX = 5.0       # λ 投影封顶
 LAMBDA_C = 0.3         # 静态成本偏好(第一请求就起作用)
 HARD_CAP_MULT = 10.0   # 硬上限 = budget × 该倍数(借鉴点 46 电路断路器)
 
+# ── cheap 意图接线(借鉴点 32 落地)──
+CHEAP_LAMBDA_MULT = 3.0  # 用户说"省钱/随便"时 λ_c 临时乘数(请求级,不落盘)
+
 # ── 陈旧度方差膨胀(借鉴点 41)──
 STALE_GROWTH = 1.15    # 每闲置一轮探索 bonus 膨胀系数
 STALE_MAX = 14.0       # 封顶倍数(≈√Vmax, 防无限膨胀吞掉成本惩罚)
@@ -297,18 +300,21 @@ class UCBBandit:
         self.plays[model] = self.plays.get(model, 0) + 1
         self.last_activity[model] = self.total_rounds
 
-    def select(self, candidates, task_type=None):
+    def select(self, candidates, task_type=None, cheap=False):
         """从候选列表中选出 UCB score 最高的模型。
 
         candidates: [{"model": "...", "base_url": "...", "api_key": "..."}, ...]
         task_type:  "coding" / "writing" / "analysis" / ... 用于专精混合
+        cheap:      True 时本轮临时抬高成本惩罚(借鉴点 32 接线,
+                    用户说"省钱/随便" → cost_mode="cheap")。只影响本轮
+                    打分,不落盘、不改变 λ_t / cost_ema 学习状态。
 
         选择顺序：
           1. 全局衰减
           2. 新臂注入先验
           3. burn-in(43)：池中存在 plays < burn_in_pulls 的臂 → 最少探索优先轮转
           4. 硬上限剪枝(46)：λ>0 时排除成本 > budget×HARD_CAP_MULT/(1+λ) 的臂
-          5. UCB 打分：avg + c·√(logN/n)·stale − (λc+λt)·c̃
+          5. UCB 打分：avg + c·√(logN/n)·stale − (λc·cheap_mult+λt)·c̃
           6. tie-breaker(54)：top-2 差 < ε → 选历史 Q 均值高者
         """
         if not candidates:
@@ -362,10 +368,15 @@ class UCBBandit:
             stale = min(STALE_GROWTH ** max(dt, 0), STALE_MAX)
             exploration *= stale
 
-            # Budget Pacer 成本惩罚(40/45)：−(λc + λt)·c̃
+            # Budget Pacer 成本惩罚(40/45)：−(λc·mult + λt)·c̃
             cost_pen = 0.0
             if self.budget > 0 or self.lambda_c > 0:
-                cost_pen = (self.lambda_c + self.lambda_t) * self._log_norm_cost(
+                # cheap 意图(借鉴点 32 落地)：临时抬高 λ_c，让"省钱"请求
+                # 在池内显著偏向便宜臂。只影响本轮打分，不落盘、不影响 λ_t。
+                # 注意：若 lambda_c=0（成本通道未启用），cheap 也无效。
+                lambda_c_eff = self.lambda_c * (
+                    CHEAP_LAMBDA_MULT if cheap else 1.0)
+                cost_pen = (lambda_c_eff + self.lambda_t) * self._log_norm_cost(
                     self._est_cost(c["model"]))
 
             score = avg + exploration - cost_pen

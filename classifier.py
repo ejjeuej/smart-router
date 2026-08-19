@@ -184,8 +184,9 @@ _OVERRIDE_COMPLEX = (
     "推导一下", "证明一下", "论证一下", "严格论证",
 )
 
-# cheap 意图（借鉴点 32）：除锁 simple 外，classify() 返回 cost_mode="cheap"，
-# 供后续 bandit 请求级 threshold 使用（本阶段仅透传，不消费）。
+# cheap 意图（借鉴点 32）：除锁 simple 外，classify() 返回 cost_mode="cheap"。
+# 已接线（2026-08-19）：__init__.py 读取并传给 bandit.select(cheap=True)，
+# 本轮临时抬高 λ_c，选池内更便宜的臂。
 _OVERRIDE_SIMPLE = (
     # 明说"随便/简单"
     "随便", "随便弄", "随便看看", "随便写写",
@@ -642,8 +643,8 @@ def classify(messages, classifier_cfg=None):
             "cost_mode": "normal",
         }
 
-    # 借鉴点 32: 用户明说"随便/省钱" → cost_mode="cheap"（本阶段仅透传，
-    # bandit 请求级 threshold 落地时再消费）。
+    # 借鉴点 32: 用户明说"随便/省钱" → cost_mode="cheap"。
+    # 已接线：__init__.py 传给 bandit.select(cheap=True)，本轮临时抬高 λ_c。
     cost_mode = "cheap" if branch == "override_simple" else "normal"
     return {
         "complexity": tier,

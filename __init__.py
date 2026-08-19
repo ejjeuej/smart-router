@@ -320,7 +320,12 @@ def on_llm_execution(request, next_call, **context):
                   if c["model"] not in exhausted_models
                   and c["model"] not in round_blacklist]
         if active:
-            selected = bandit.select(active, task_type=task_type)
+            # 借鉴点 32 接线：用户明说"省钱/随便/便宜点" →
+            # classifier 返回 cost_mode="cheap" → bandit 本轮临时抬高 λ_c，
+            # 在池内显著偏向便宜臂（只影响本轮打分，不落盘、不改学习状态）。
+            selected = bandit.select(
+                active, task_type=task_type,
+                cheap=result.get("cost_mode") == "cheap")
             if selected:
                 tried_models.add(selected["model"])
                 try:
@@ -400,7 +405,14 @@ def on_llm_execution(request, next_call, **context):
                         save_one(pool_key)
 
     # ── 顺序 fallback：逐个尝试未试过的候选 ──
-    for c in candidates:
+    fallback_list = candidates
+    if use_bandit and result.get("cost_mode") == "cheap":
+        # cheap 意图：fallback 也按估计成本升序，先试便宜的（bandit 已
+        # 在 use_bandit 分支内创建，此处安全引用；未启用 bandit 时无价格
+        # 信号，保持原白名单顺序）。
+        fallback_list = sorted(candidates,
+                               key=lambda c: bandit._est_cost(c["model"]))
+    for c in fallback_list:
         if c["model"] in exhausted_models:
             info(f"skipping {c['model']} — quota exhausted")
             continue
