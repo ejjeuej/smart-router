@@ -211,7 +211,9 @@ def _hermes_home() -> Path:
          但插件是独立代码看不到），只能靠探测：目录存在即视为 home。
          这也是 .env / config.yaml / plugins 实际所在的位置。
          两个目录都探测，优先 sinoregal（新版），找不到才退回 hermes（旧版兼容）。
-      3. 原版默认 ~/.hermes（NousResearch hermes / POSIX 部署）
+      3. POSIX（macOS / Linux）：~/.sinoregal（新版 Sinoregal Agent，与
+         Windows 的 %LOCALAPPDATA%\\sinoregal 对称）→ ~/.hermes（旧版
+         NousResearch hermes，兜底），按新版优先探测。
     """
     env = os.environ.get("HERMES_HOME", "").strip()
     if env:
@@ -227,6 +229,16 @@ def _hermes_home() -> Path:
                         return candidate
                 except OSError:
                     pass
+    else:
+        # POSIX：新版 Sinoregal Agent 数据目录 ~/.sinoregal（新版优先），
+        # 旧版 hermes 兜底 ~/.hermes。
+        for name in (".sinoregal", ".hermes"):
+            candidate = Path.home() / name
+            try:
+                if candidate.is_dir():
+                    return candidate
+            except OSError:
+                pass
     return Path.home() / ".hermes"
 
 
