@@ -743,7 +743,9 @@ def _llm_classify_fast(message: str, state: ConversationState,
         "判断标准:\n"
         "- complex: 多步规划/设计、写代码、调试修复、数学证明、专业分析"
         "(架构/性能/根因/算法), 需要深度推理的任务\n"
-        "- simple: 寒暄确认、简单查询、翻译/润色/格式化等机械活、"
+        "- simple: 寒暄确认、简单查询、概念讲解(什么是X/X是什么/解释概念)、"
+        "纯命令/安装指令(如 pip install、npm install)、"
+        "翻译/润色/格式化等机械活、"
         "生活琐事建议(吃什么/穿什么/去哪儿玩)、闲聊倾诉\n"
         "- 多轮: 若 recent topics 显示在延续复杂任务('那如果改成X呢'等假设追问), "
         "应继承 complex; 若是新话题则独立判断\n\n"
@@ -761,11 +763,21 @@ def _llm_classify_fast(message: str, state: ConversationState,
             from openai import OpenAI
             client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"],
                             timeout=6.0, max_retries=0)
+            # 分类只出 30-token JSON, 必须显式关思考: 上游默认开 thinking,
+            # qwen flash 系思考 12~19s 远超 6s 超时(2026-08-20 端到端实测:
+            # 分类链全挂 → 灰区兜底 simple → 复杂任务漏升)。
+            # 参数名与 _thinking_params_for 的平台分支保持一致。
+            url = str(cfg.get("base_url", "")).lower()
+            if "open.bigmodel.cn" in url or "moonshot.cn" in url:
+                eb = {"thinking": False}
+            else:
+                eb = {"enable_thinking": False}
             response = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=30,
                 temperature=0,
+                extra_body=eb,
             )
             raw = response.choices[0].message.content.strip()
 
