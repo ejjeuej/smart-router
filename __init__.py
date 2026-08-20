@@ -198,11 +198,14 @@ def _inject_tier_hint(request: dict, tier: str) -> dict:
 #   ② 上游平台 —— 决定参数名：智谱/Kimi 官方接口用 thinking，
 #      百炼/OpenAI 兼容统一用 enable_thinking。
 # request 里已有 thinking 相关字段则透传不动（尊重 Hermes /thinkon
-# /thinkoff 与 reasoning_effort 等显式设置）。
+# /thinkoff 与 reasoning_effort 等显式设置）。注意 extra_body 不在此列：
+# 它可能是其他用途的透传通道，注入时合并而非阻断（内部已有思考键才阻断）。
 _THINKING_CTL_KEYS = (
     "enable_thinking", "thinking", "thinking_config",
-    "reasoning_effort", "reasoning", "extra_body",
+    "reasoning_effort", "reasoning",
 )
+# extra_body 内部出现这些键 = 已有显式思考控制，同样透传不动
+_THINKING_EB_KEYS = ("enable_thinking", "thinking", "thinking_config")
 
 # 已知"默认支持思考"的模型家族（启发式，按模型名子串匹配，防厂商前缀
 # 如 zhipu-glm4 / alibaba-qwen 与日期后缀如 -2026-02-23 的干扰）。
@@ -240,14 +243,24 @@ def _thinking_params_for(model: str, base_url: str) -> dict:
 
 
 def _ensure_thinking(modified: dict, model: str, base_url: str = "") -> dict:
-    """确保转发请求携带思考开关（对齐 Hermes transport 层的默认注入）。"""
+    """确保转发请求携带思考开关（对齐 Hermes transport 层的默认注入）。
+
+    注入通道必须是 extra_body：enable_thinking / thinking 都是平台私有参数，
+    OpenAI SDK 的 create() 对未知顶层 kwarg 直接抛 TypeError（端到端评测
+    实测踩坑），extra_body 会被 SDK 原样合并进请求 JSON body —— 这也是
+    DashScope 官方文档给的接法。
+    """
     try:
         if any(k in modified for k in _THINKING_CTL_KEYS):
             return modified  # 已有显式控制，透传不动
         params = _thinking_params_for(model, base_url)
         if params:
+            eb = dict(modified.get("extra_body") or {})
+            if any(k in eb for k in _THINKING_EB_KEYS):
+                return modified  # extra_body 内已有思考控制，透传不动
             m = dict(modified)
-            m.update(params)
+            eb.update(params)
+            m["extra_body"] = eb
             return m
     except Exception:
         pass
