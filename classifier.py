@@ -295,6 +295,35 @@ def _is_summary_mech(message: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 簇C(2026-08-20): 长文纯摘要拦截 —— 机械摘要 flash 能干, 不烧 complex 池
+# 根因一(浅): r2_long_signal 不区分"长文+分析"与"长文+机械摘要"。
+# 根因二(深): 长文正文碰 type 关键词(如第217字的"谁"命中 factual 正则)
+#             → type_matched=True → 整条长文被判"带信号"升 complex, 与请求意图无关。
+# 方案: 摘要动词(总结/概括/摘要/提炼/归纳…) + 长文(>200) → simple;
+#       "评估漏洞/评审意见/分析论证" 等评估语义被排除词放行(保持 complex)。
+# 与簇B 的区分: 簇B 拦"报错/日志"目标词(短文本也拦); 簇C 只拦"文章/报道/报告/
+#   文档/论文"类长文, 需要 len>200 才触发(短摘要请求走类型权重/灰区)。
+# ═══════════════════════════════════════════════════════════════════════════
+_LONG_SUMMARY_VERBS = (
+    "总结", "概括", "摘要", "提炼", "归纳",
+    "讲了什么", "说了什么", "主要内容", "要点",
+)
+_LONG_SUMMARY_EXCLUDE = (
+    "评估", "评价", "评论", "批判", "漏洞", "评审", "审阅", "意见", "点评",
+    "分析", "建议", "立场", "论证", "对比",
+    "review", "critique", "assess", "evaluate", "analy",
+)
+
+
+def _is_long_summary(message: str) -> bool:
+    """簇C: 长文机械摘要意图 → True。摘要动词命中且无评估语义。"""
+    m = message.lower()
+    if any(x in m for x in _LONG_SUMMARY_EXCLUDE):
+        return False
+    return any(v in m for v in _LONG_SUMMARY_VERBS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # R2.3 增强: 短确认整词表（借鉴点 28 — ThinkGate isShortAck）
 # 替代纯 length<=3 一刀切：先去尾标点再整词匹配；查不到再退长度条件
 # （与 ThinkGate 双条件一致，见 R2.3 分支）。
@@ -474,6 +503,7 @@ def _route_with_branch(message: str, state: ConversationState):
       R0   context inheritance（上轮 complex + 跟帖 → complex；
                                 上轮 simple + 继续专属词 → simple）
       R2   explicit complex（code/math/语言签名需 length>20）
+      R21  long summary（簇C: 长文纯摘要 → simple，先于 r2_long_signal）
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
       R2c  complex signal（架构/分布式/死锁…，length>10 且非纯求知）
       R2d  multi-question（≥3 问号且 len>40 → 分析型）
@@ -536,6 +566,12 @@ def _route_with_branch(message: str, state: ConversationState):
     # 短代码也烧贵模型。
     if (f["has_code"] or f["has_math"]) and f["length"] > 20:
         return "complex", "r2_code_math"
+
+    # 簇C(2026-08-20): 长文纯摘要 → simple(拦截在 r2_long_signal 之前)。
+    # "帮我总结这篇文章:<300字>" 不再因正文碰词/类型命中被升 complex。
+    # "…并评估其论证漏洞""读论文给评审意见" 带评估语义 → 排除词放行 → 继续 R2b 升。
+    if f["length"] > 200 and _is_long_summary(message):
+        return "simple", "r21_long_summary"
 
     # R2b: 长度不再单独定级（借鉴点 25 — ThinkGate "classify intent not length"）
     # 长 + 带分析特征（代码/数学/类型命中）→ complex；纯长粘贴（日志/清单）→
