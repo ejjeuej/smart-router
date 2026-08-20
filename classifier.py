@@ -675,7 +675,8 @@ def _route_with_branch(message: str, state: ConversationState):
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
       R2c  complex signal（架构/分布式/死锁…，length>10 且非纯求知）
       R2ca algo name（簇E: 算法名 → complex，豁免长度门槛）
-      R2d  multi-question（≥3 问号且 len>40 → 分析型）
+      R2d  multi-question（≥3 问号且 len>40 → 分析型；问号散布多行
+           = 粘贴正文嫌疑 → 灰区 r2d_multi_q_paste，簇J-C）
       R2.3 short confirm / greeting / thanks → simple
       R2.4 mech layer（机械词 → simple，不调 LLM）
       R2.5 no-type grey zone → llm
@@ -785,8 +786,17 @@ def _route_with_branch(message: str, state: ConversationState):
     # 簇D(2026-08-20): 放宽为 len>40 或（≥3 问号 且 含分析词）——中文多问句
     #   天然短("怎么引流？怎么转化？怎么留存？"仅13字), 纯长度门槛漏掉。
     #   反例 5 条("谁去？几点？在哪集合？"等纯事实多问句)不含分析词, 不误伤。
+    # 簇J-C(2026-08-20): 指令段在结尾的粘贴场景 → 灰区。用户先粘贴对话/正文
+    #   再补一句指令时, 首行指令识别(r26)够不着; 此时问号来自粘贴正文而非
+    #   用户追问, 特征不可信。结构性判据: 真人手打的多问句几乎必在一行内
+    #   ("如何做A？如何保证B？"), 问号散布在 ≥2 个不同行 = 多半是粘贴的
+    #   对话/文章 → 弃权交 LLM(它天然能看懂"指令在尾"), 不硬判。
     if f["q_mark_count"] >= 3 and (
             f["length"] > 40 or _has_analysis_quest_word(message)):
+        q_mark_lines = [ln for ln in message.splitlines()
+                        if "？" in ln or "?" in ln]
+        if len(q_mark_lines) >= 2:
+            return "llm", "r2d_multi_q_paste"
         return "complex", "r2_multi_q"
 
     # R2.3: 短确认/寒暄/致谢 → simple。
