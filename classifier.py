@@ -351,6 +351,8 @@ _COMPLEX_SIGNALS = (
     "重构", "refactor", "调试", "debug",
     # 数学/证明级
     "证明", "prove that", "定理", "theorem", "推导",
+    # 明确复杂排查/设计级(簇A 配套 —— 宽词 + 这些词直接升, 不依赖 LLM)
+    "内存泄漏", "性能瓶颈", "限流", "熔断",
 )
 
 # 求知型词：信号词出现在"什么是X/解释X/区别"里时，是讲解需求而非实际任务。
@@ -363,6 +365,21 @@ _KNOWLEDGE_ASKS = (
 def _has_complex_signal(message: str) -> bool:
     m = message.lower()
     return any(w in m for w in _COMPLEX_SIGNALS)
+
+
+def _has_strong_complex_signal(f: dict, message: str) -> bool:
+    """override 命中 complex 时, 哪些信号让它"直接升"而非进灰区(簇A 定稿 2026-08-20)。
+
+    强信号 = 代码/数学/复杂度词/多问号/长文 —— 这些场景"升 complex"确定性高,
+    无需 LLM 裁决; 弱信号(生活琐事、模糊建议、宽词+普通内容)进灰区,
+    LLM 判 simple 就不烧钱, 判 complex 说明语义上真复杂, 不算误升。
+    """
+    return (
+        f["has_code"] or f["has_math"]
+        or _has_complex_signal(message)
+        or f["q_mark_count"] >= 3
+        or f["length"] > 200
+    )
 
 
 def _is_knowledge_ask(message: str) -> bool:
@@ -396,10 +413,15 @@ def _route_with_branch(message: str, state: ConversationState):
     f = extract_features(message)
 
     # R1: 用户显式意图（借鉴点 26 — ThinkGate detectOverride）
-    # 用户自己说了难易 → 直接短路，跳过一切后续判断。
+    # 用户自己说了难易 → 直接短路, 跳过一切后续判断。
     override = _detect_user_override(message)
     if override == "complex":
-        return "complex", "override_complex"
+        # 簇A 定稿(2026-08-20): 宽词命中但无强信号 → 不硬判 complex, 交灰区。
+        # 修复"帮我分析中午吃什么/认真想想今天穿什么"误升烧钱——
+        # 烧钱口子在花大钱(调复杂模型)之前堵住即可, 灰区 LLM 几厘钱就是裁决。
+        if _has_strong_complex_signal(f, message):
+            return "complex", "override_complex"
+        return "llm", "override_complex"
     if override == "simple":
         return "simple", "override_simple"
 
@@ -517,6 +539,15 @@ def _llm_classify_fast(message: str, state: ConversationState,
     recent = state.recent_topics[-2:] if state.recent_topics else []
     recent_str = ", ".join(recent) if recent else "(none)"
     prompt = (
+        "你是 smart-router 的复杂度分类器。判断用户请求该由'轻量模型'(simple) "
+        "还是'强模型'(complex)处理。\n\n"
+        "判断标准:\n"
+        "- complex: 多步规划/设计、写代码、调试修复、数学证明、专业分析"
+        "(架构/性能/根因/算法), 需要深度推理的任务\n"
+        "- simple: 寒暄确认、简单查询、翻译/润色/格式化等机械活、"
+        "生活琐事建议(吃什么/穿什么/去哪儿玩)、闲聊倾诉\n"
+        "- 多轮: 若 recent topics 显示在延续复杂任务('那如果改成X呢'等假设追问), "
+        "应继承 complex; 若是新话题则独立判断\n\n"
         f"Recent topics: [{recent_str}]\n"
         f"Message: {message}\n\n"
         f'Reply with ONLY JSON — no other text:\n'
