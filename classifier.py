@@ -83,7 +83,12 @@ REFERENCE_PATTERN = r"这|那个|它|上面|刚才|前面|这个|之前说"
 
 CODE_PATTERN = (
     r"```|def |class |function |import |"
-    r"error|exception|bug|报错|堆栈|traceback|"
+    # error 需词边界(簇I 2026-08-20): "=IFERROR(VLOOKUP(..))" 这类 Excel 公式里
+    # 的 error 子串曾把"这个公式什么意思"误升 complex。常见异常类名
+    # (KeyError/TypeError…)本身无词边界, 显式列出保留——它们是真报错意图。
+    r"\berror\b|typeerror|keyerror|valueerror|attributeerror|runtimeerror|"
+    r"indentationerror|zerodivisionerror|overflowerror|memoryerror|"
+    r"oserror|ioerror|connectionerror|exception|bug|报错|堆栈|traceback|"
     r"\.py|\.ts|\.js|\.json|\.yaml|\.toml"
 )
 
@@ -163,6 +168,42 @@ TYPE_WEIGHTS = {
     "explanation": 0.5,
     "factual": 0.2,
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 簇H(2026-08-20): 短写作降灰 —— "写"类 type 权重不分长短的误升
+# 根因: TYPE_PATTERNS 的 code_gen 含裸"写"(0.8 权重), "给我妈写句生日祝福"
+#       "写个朋友圈文案" 这类 ≤25 字的生活写作被整体拉 complex, 全在烧钱方向。
+# 方案: code_gen/creative 类型 + 长度≤25 + 无技术名词 + 无长文量词
+#       → 不吃高权重, 降灰区交 LLM(误判成本几厘 vs 误升成本几毛)。
+# 技术名词表 = "写个二分查找/下载器/HTTP客户端"这类短技术请求的放行白名单;
+# 长文量词表 = "写一篇议论文800字/英文邮件"这类真要长输出的放行白名单。
+# ═══════════════════════════════════════════════════════════════════════════
+_WRITE_TECH_NOUNS = (
+    "排序", "算法", "函数", "脚本", "爬虫", "正则", "组件", "接口", "服务器",
+    "客户端", "数据库", "缓存", "队列", "线程", "协程", "协议", "编译", "部署",
+    "监控", "系统", "模块", "页面", "网站", "代码", "游戏", "下载器", "浏览器",
+    "解析器", "生成器", "转换器", "中间件", "定时任务", "调度", "压测",
+    "api", "sql", "http", "tcp", "app",
+)
+_WRITE_LONG_FORMS = (
+    "文章", "论文", "报告", "议论文", "邮件", "演讲稿", "故事", "小说",
+    "策划案", "千字", "万字", "字以上", "字左右",
+)
+
+
+def _is_short_life_write(f: dict, message: str) -> bool:
+    """簇H: 短且无技术/长文标志的"写"类请求 → 不吃 code_gen 0.8 高权重。"""
+    if f["question_type"] not in ("code_gen", "creative"):
+        return False
+    if f["length"] > 25 or f["has_code"] or f["has_math"]:
+        return False
+    m = message.lower()
+    if any(w in m for w in _WRITE_TECH_NOUNS):
+        return False
+    if any(w in m for w in _WRITE_LONG_FORMS):
+        return False
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -259,6 +300,67 @@ _PURE_IMPORT_LINE = re.compile(
 def _is_pure_import(message: str) -> bool:
     lines = [ln.strip() for ln in message.splitlines() if ln.strip()]
     return bool(lines) and all(_PURE_IMPORT_LINE.match(ln) for ln in lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 簇J(2026-08-20): 粘贴正文污染 —— 特征只看指令段
+# 根因: 特征提取对整条消息计数, 粘贴正文里的问号/bug/技术词把机械任务误升:
+#   "把客服对话总结成一句话:<对话>"  正文问号 → r2_multi_q 误升;
+#   "帮我写周报，素材:<素材>"       素材里"bug" → r2_code_math 误升。
+# 方案: 指令段(首行; 单行时取全角冒号前)是机械摘要/周报动词, 且无评估语义、
+#       不含"文章/报道/论文"(那是簇C r21 长文摘要的地盘) → simple,
+#       拦在 r2_code_math / r2_multi_q 之前, 正文特征不参与定级。
+# 边界: 指令段带"评估/分析/根因/审查"是真复杂任务 → 排除词放行;
+#       "帮我看看这个报错:<traceback>" 指令段无摘要动词, 不受影响。
+# ═══════════════════════════════════════════════════════════════════════════
+_PASTE_MECH_VERBS = (
+    "总结", "概括", "摘要", "提炼", "归纳", "周报", "日报", "月报",
+    "翻译成人话", "翻译成大白话", "列成要点", "summarize",
+)
+_PASTE_MECH_EXCLUDE = (
+    "评估", "评价", "分析", "评审", "审阅", "批判", "根因", "漏洞", "风险",
+    "优缺点", "意见", "review", "critique", "evaluate", "analy",
+)
+_PASTE_MECH_RELAY = ("文章", "报道", "论文", "报告", "文档", "文件", "这篇", "这段代码")
+
+
+def _is_paste_mech_summary(message: str) -> bool:
+    """簇J: 机械摘要指令 + 粘贴正文 → True(正文特征不参与定级)。"""
+    lines = message.splitlines()
+    if not lines:
+        return False
+    head = lines[0]
+    if "：" in head:
+        head = head.split("：", 1)[0]
+    if len(head) > 60:
+        return False
+    body = "\n".join(lines[1:]) if len(lines) > 1 else message[len(head):]
+    if len(body.strip()) < 15:
+        return False
+    low = head.lower()
+    if any(w in low for w in _PASTE_MECH_EXCLUDE):
+        return False
+    if any(w in low for w in _PASTE_MECH_RELAY):
+        return False
+    return any(w in low for w in _PASTE_MECH_VERBS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 簇J2(2026-08-20): 补文档/注释类机械写活 —— 与簇F"加注释"同族
+# "帮我给这个函数补个 docstring：def moving_avg(...)" 带 def 也会被
+# r2_code_math 误升; 抄写/套版式工种 flash 能干, 前置拦截。
+# 保护: 算法名请求("快速排序算法并加详细注释")由 _has_algo_name 放行,
+#       "翻译一下这段代码的注释" 的动词不是加/补/写, 正则不匹配。
+# ═══════════════════════════════════════════════════════════════════════════
+_DOC_MECH_PATTERN = re.compile(
+    r"(加|补|写|添加|补全|完善|生成)"
+    r"[\u4e00-\u9fff a-z]{0,8}"
+    r"(注释|docstring|文档说明|文档字符串)"
+)
+
+
+def _is_doc_mech(message: str) -> bool:
+    return bool(_DOC_MECH_PATTERN.search(message.lower()))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -517,8 +619,11 @@ def _has_algo_name(message: str) -> bool:
 # 求知型词：信号词出现在"什么是X/解释X/区别"里时，是讲解需求而非实际任务。
 # 带这些词的请求走解释/类型权重流程（短句甚至直接 simple），不升 complex。
 # 含英文 explain——簇E 修复时发现 "explain why quicksort..." 被算法名硬判。
+# 含"是多少"(簇I 2026-08-20): "快速排序平均时间复杂度是多少"是查参数,
+# 不是"用快排解题", 与"什么是动态规划"同属求知反例。
 _KNOWLEDGE_ASKS = (
     "什么是", "啥是", "是什么", "解释", "讲讲", "介绍一下", "科普", "区别",
+    "是多少",
     "explain", "what is", "what's",
 )
 
@@ -563,6 +668,8 @@ def _route_with_branch(message: str, state: ConversationState):
       R0   context inheritance（上轮 complex + 跟帖 → complex；
                                 上轮 simple + 继续专属词 → simple）
       R22  pure import（簇F: 整条消息仅 import/from 语句 → simple）
+      R22b doc mech（簇J2: 带代码的补注释/docstring 请求 → simple）
+      R26  paste mech（簇J: 机械摘要指令+粘贴正文 → simple, 正文特征不计）
       R2   explicit complex（code/math/语言签名需 length>20）
       R21  long summary（簇C: 长文纯摘要 → simple，先于 r2_long_signal）
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
@@ -632,6 +739,16 @@ def _route_with_branch(message: str, state: ConversationState):
     if _is_pure_import(message):
         return "simple", "r22_pure_import"
 
+    # 簇J2(2026-08-20): 补文档/注释机械写活, 带 def 也拦在 r2_code_math 之前。
+    # 仅当消息本身带代码时才拦(指令挂在粘贴代码上); 无代码的"加注释"走 r24_mech。
+    if f["has_code"] and _is_doc_mech(message) and not _has_algo_name(message):
+        return "simple", "r22_doc_mech"
+
+    # 簇J(2026-08-20): 机械摘要指令 + 粘贴正文 → simple, 正文特征不参与定级。
+    # 客服对话里的问号/周报素材里的 bug 不再把机械活推上 complex 池。
+    if _is_paste_mech_summary(message):
+        return "simple", "r26_paste_mech"
+
     # R2: explicit complex signals — no LLM needed
     # 借鉴点 1+B6: code/math 还需 length>20，防 "pip install"/"import os" 这类
     # 短代码也烧贵模型。
@@ -699,6 +816,10 @@ def _route_with_branch(message: str, state: ConversationState):
     # R3: 类型权重评分（去掉 complexity_score 融合，结果只依赖当前消息）
     type_weight = TYPE_WEIGHTS.get(f["question_type"], 0.3)
     if type_weight > 0.6:
+        # 簇H(2026-08-20): 短生活写作不吃 code_gen 0.8 高权重 → 降灰区。
+        # "给我妈写句生日祝福/写个朋友圈文案" 交 LLM 裁决, 不烧 complex 池。
+        if _is_short_life_write(f, message):
+            return "llm", "r3_short_write"
         return "complex", "r3_complex"
     elif type_weight < 0.3:
         return "simple", "r3_simple"
