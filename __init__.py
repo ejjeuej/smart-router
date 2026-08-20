@@ -367,10 +367,16 @@ def on_llm_execution(request, next_call, **context):
     # ── 选池：task_type + complexity 联合决策 ──
     # coding/reasoning 强制 complex；chat/translation 强制 simple；
     # 其余（other/writing/analysis）交给 complexity 判定。
+    # 例外：override_simple（用户显式"随便/简单/省钱"，cost_mode=cheap）
+    # 优先级最高——"随便写个hello world"虽 task_type=coding，也尊重用户
+    # 意图走 simple 池（端到端抽验 2026-08-20 暴露：误升烧钱 1 例，
+    # 分类器判 simple 正确但被 FORCE_COMPLEX 拉进复杂池）。
     FORCE_COMPLEX = {"coding", "reasoning"}
     FORCE_SIMPLE = {"chat", "translation"}
 
-    if task_type in FORCE_COMPLEX:
+    if result.get("cost_mode") == "cheap" and task_type in FORCE_COMPLEX:
+        pool_key = "simple_models"
+    elif task_type in FORCE_COMPLEX:
         pool_key = "complex_models"
     elif task_type in FORCE_SIMPLE:
         pool_key = "simple_models"
