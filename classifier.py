@@ -241,6 +241,60 @@ def _is_mech_simple(message: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 簇B(2026-08-20): 机械摘要前置拦截 —— 摘要动词 × 报错/日志目标词 组合
+# 根因: R2.4 机械层排在 R2 之后, 且 has_code(CODE_PATTERN 含"报错/traceback/
+#       error") 会让 R2.4 放行——"总结一下这个报错" 这类机械活永远到不了
+#       机械层, 被 R2 code_math 升 complex 烧钱(证据 5/7)。
+# 方案: 摘要动词×目标词组合匹配, 前置到 R0 上下文继承之前——机械活不随
+#       会话状态变, 任何上下文里"总结报错"都该是 simple。
+# 边界: "分析根因/修复/定位/排查/给方案" 是真正排查任务 → 排除词拦下;
+#       "帮我分析"(R1 override)本就优先短路, 双重保护不误杀。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SUMMARY_VERBS = (
+    # 中文摘要动词
+    "总结", "概括", "摘要", "提炼",
+    # 通俗化（把技术报错翻译成人话）
+    "翻译成人话", "翻译成大白话", "大白话解释", "用大白话",
+    # 询问含义
+    "什么意思", "啥意思", "讲了什么",
+    # 英文摘要/通俗化
+    "summarize", "summarise", "sum up", "in plain",
+    "paraphrase", "what does this error mean",
+)
+
+# 中文目标子串（"错误/日志" 罕见误伤可接受）；英文需词边界防 "逻辑"→log 误伤
+_SUMMARY_TARGETS = (
+    "报错", "错误", "日志", "异常",
+)
+_SUMMARY_TARGETS_EN = (
+    r"\berror", r"\bexception", r"\btraceback",
+    r"\bstack trace", r"\bpanic", r"\blog\b",
+)
+
+# 排查语义 → 不是机械活，必须保持 complex
+_SUMMARY_EXCLUDE = (
+    "根因", "原因", "修复", "解决", "定位", "排查", "方案",
+    "怎么改", "如何改", "怎么解决", "如何解决", "怎么修", "怎么定位", "怎么排查",
+    "fix", "debug", "solve", "why", "root cause",
+)
+
+
+def _is_summary_mech(message: str) -> bool:
+    """簇B: 机械摘要(报错/日志) → True。摘要词+目标词都命中, 且无排查语义。"""
+    import re as _re
+    m = message.lower()
+    if any(x in m for x in _SUMMARY_EXCLUDE):
+        return False
+    verb_hit = any(v in m for v in _SUMMARY_VERBS)
+    if not verb_hit:
+        return False
+    target_hit = any(t in m for t in _SUMMARY_TARGETS) or any(
+        _re.search(p, m) for p in _SUMMARY_TARGETS_EN)
+    return target_hit
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # R2.3 增强: 短确认整词表（借鉴点 28 — ThinkGate isShortAck）
 # 替代纯 length<=3 一刀切：先去尾标点再整词匹配；查不到再退长度条件
 # （与 ThinkGate 双条件一致，见 R2.3 分支）。
@@ -398,6 +452,7 @@ def _route_with_branch(message: str, state: ConversationState):
       R1   user override（用户明说难易）→ 最强信号，先查
       R0b  downgrade（用户放弃任务 → 强制 simple + 重置状态）
       R0c  task-switch（用户换话题 → 刷新状态，不直接定档，继续往下走）
+      R20  mech summary（簇B: 总结报错/概括日志 → simple，先于上下文继承与 code 信号）
       R0   context inheritance（上轮 complex + 跟帖 → complex；
                                 上轮 simple + 继续专属词 → simple）
       R2   explicit complex（code/math/语言签名需 length>20）
@@ -437,6 +492,13 @@ def _route_with_branch(message: str, state: ConversationState):
     # 是好是坏交给后续规则正常判断。
     if _is_task_switch(message):
         state.last_turn_complex = False
+
+    # 簇B(2026-08-20): 机械摘要前置拦截 —— 优先级高于 R0 上下文继承与 R2 code 信号。
+    # "总结一下这个报错/概括日志/把报错翻译成人话" → 机械活, flash 就能干。
+    # 放 R0 之前: 机械活不随会话状态变(上轮在写代码, 这句也仍是 simple 机械活)。
+    # "分析根因/修复/定位" 等排查语义已被排除词拦下, 不会误杀。
+    if _is_summary_mech(message):
+        return "simple", "r20_summary_mech"
 
     # R0: 上下文继承（布尔 last_turn_complex + 跟帖/继续词）
     #
