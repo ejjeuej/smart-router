@@ -48,7 +48,7 @@ W_C = 0.4              # 成本分量权重
 W_L = 0.3              # 延迟分量权重
 PEN_RATE_LIMIT = 0.3   # 429/5xx 软惩罚(借鉴点 50)
 PEN_QUOTA = 0.5        # 403/余额耗尽软惩罚
-LATENCY_MAX = 20000.0  # 延迟归一化封顶(ms,≈REQUEST_TIMEOUT)
+LATENCY_MAX = 60000.0  # 延迟归一化封顶(ms,≈REQUEST_TIMEOUT, 20s→60s 同步 2026-08-20)
 
 # ── 成本 log 归一化(借鉴点 45)──
 C_FLOOR = 1e-4         # $/1k tokens 下限

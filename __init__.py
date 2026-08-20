@@ -81,7 +81,9 @@ _PERMANENT_BROKEN_MARKERS = (
     "invalid_parameter",        # 400 code=invalid_parameter_error（enable_thinking / max_tokens 范围等）
 )
 
-REQUEST_TIMEOUT = 20.0  # 单次模型调用超时（秒），避免坏端点/长跑模型卡死
+REQUEST_TIMEOUT = 60.0  # 单次模型调用超时（秒），避免坏端点/长跑模型卡死
+                        # 20s→60s(2026-08-20): complex 池 qwen3.7-max/deepseek-v4
+                        # 开思考后 30s+ 被掐断, 端到端三轮复验每次都有 20s 超时
 
 
 def _is_permanent_broken(err_str: str) -> bool:
