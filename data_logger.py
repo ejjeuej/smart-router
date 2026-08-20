@@ -58,10 +58,14 @@ def log_classification(
         "model_actual": model_actual,
     }
 
-    data_dir = _get_data_dir()
-    data_dir.mkdir(parents=True, exist_ok=True)
-    log_path = data_dir / "classifications.jsonl"
+    try:
+        data_dir = _get_data_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        log_path = data_dir / "classifications.jsonl"
 
-    with _LOCK:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with _LOCK:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # 日志失败静默丢弃，绝不影响路由主流程（与 logger.py 同一原则）
+        return

@@ -417,7 +417,6 @@ class UCBBandit:
             c_tilde = self._log_norm_cost(self._cost_of_tokens(model, total_tokens))
             l_tilde = min(1.0, (latency_ms or 0) / LATENCY_MAX)
             reward = self.w_q * q - self.w_c * c_tilde - self.w_l * l_tilde - penalty
-            reward = max(reward, 0.01)   # 成功保底为正，避免长期为负拖垮均值
         else:
             reward = 0.0 if penalty <= 0 else -abs(float(penalty))
 
@@ -461,6 +460,31 @@ class UCBBandit:
                 self.lambda_t + ETA * (ratio - 1.0), 0.0), LAMBDA_MAX)
 
         return reward
+
+    def merge_tokens(self, model, extra_tokens, task_type=None):
+        """工具续调补记：把同一轮对话里后续续调的 token 并入统计。
+
+        首轮已通过 update() 记过一笔（pulls / reward / total_rounds 只算
+        一次）；续调（携带工具结果的再次调用，token 量往往更大）只补
+        total_tokens，不重复计数——否则一次对话会被统计成多次调用，
+        均 token 口径反而失真。
+        """
+        if not extra_tokens:
+            return
+        o = self.stats.get(model, {}).get("overall")
+        if o is None:
+            return  # 没有首轮记录（异常路径），无从合并
+        o["total_tokens"] += extra_tokens
+        t = self.stats[model].get(task_type) if task_type else None
+        if t:
+            t["total_tokens"] += extra_tokens
+        # 预算保护同样要看到这笔成本（与 update 相同的 EMA / λ 更新）
+        if self.budget and self.budget > 0:
+            cost_extra = self._cost_of_tokens(model, extra_tokens)
+            self.cost_ema = (1.0 - ALPHA_EMA) * self.cost_ema + ALPHA_EMA * cost_extra
+            ratio = self.cost_ema / self.budget if self.budget else 1.0
+            self.lambda_t = min(max(
+                self.lambda_t + ETA * (ratio - 1.0), 0.0), LAMBDA_MAX)
 
     # ── 序列化 ──────────────────────────────────────────────────────
 

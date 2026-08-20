@@ -295,6 +295,19 @@ def on_llm_execution(request, next_call, **context):
                 _t_call = time.monotonic()
                 response = client.chat.completions.create(**modified)
                 _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
+                # 续调 token 合并记账：只补 total_tokens，不重复计 pulls/轮次
+                try:
+                    if cfg.get("bandit", {}).get("enabled"):
+                        from bandit import get_bandit, save_one
+                        _pkey = _last_routed.get("pool_key", "simple_models")
+                        _b = get_bandit(_pkey, cfg.get("bandit", {}))
+                        _tokens = response.usage.total_tokens if response.usage else 0
+                        _b.merge_tokens(
+                            _last_routed["model"], _tokens,
+                            task_type=_last_routed.get("task_type"))
+                        save_one(_pkey)
+                except Exception:
+                    pass  # 补记失败不影响续调结果
                 return _annotate_response(
                     response, cfg, _last_routed["model"],
                     _last_routed.get("complexity", "?"),
@@ -410,7 +423,7 @@ def on_llm_execution(request, next_call, **context):
     bandit_cfg = cfg.get("bandit", {})
     use_bandit = bandit_cfg.get("enabled", False)
 
-    exhausted_models = set()   # 额度耗尽，进程生命周期永久拉黑
+    exhausted_models = set()   # 额度耗尽，仅本次请求拉黑（函数每次调用重建）
     round_blacklist = set()    # 临时故障，仅本轮拉黑
     tried_models = set()
 
