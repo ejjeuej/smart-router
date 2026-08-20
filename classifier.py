@@ -405,6 +405,19 @@ def _is_followup(message: str) -> bool:
     return any(p in message for p in FOLLOWUP_PATTERNS)
 
 
+# 簇G(2026-08-20): 假设追问词 —— 上轮 complex 时, "那如果改成X呢/换成Y/
+# 用Z替代/假如..." 等假设问句继承 complex(文档方案②)。只在 R0 分支内
+# 生效(配合 last_turn_complex 布尔), simple 会话不会误继承——反例
+# "然后帮我查下天气"(上轮 simple)已验证不受影响。
+_HYPOTHETICAL_PATTERNS = (
+    "如果", "假如", "假设", "要是", "换成", "改成", "替代", "替换",
+)
+
+
+def _is_hypothetical(message: str) -> bool:
+    return any(p in message for p in _HYPOTHETICAL_PATTERNS)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # R0b/R0c/R0: 跨轮 session 关系（借鉴点 15 — fog 跨轮检测 + SSR 会话机制）
 # 单轮文本分类器无记忆，但会话状态里有上一轮档位。三类关系词：
@@ -471,6 +484,9 @@ _COMPLEX_SIGNALS = (
     "代码审查", "code review", "根因分析", "root cause", "竞态", "race condition",
     "死锁", "deadlock", "性能优化", "optimize", "权衡", "trade-off", "tradeoff",
     "重构", "refactor", "调试", "debug",
+    # SQL 技术词(簇G 配套 2026-08-20): "帮我优化这段SQL查询" 不再落灰区。
+    # "sql 是什么/区别" 等求知句被 _is_knowledge_ask 保护, 不误伤。
+    "sql",
     # 数学/证明级
     "证明", "prove that", "定理", "theorem", "推导",
     # 明确复杂排查/设计级(簇A 配套 —— 宽词 + 这些词直接升, 不依赖 LLM)
@@ -602,7 +618,11 @@ def _route_with_branch(message: str, state: ConversationState):
     #   → 复用 simple（借鉴点 15 补齐的"向下复用"方向）。
     # 布尔信号替代原来的衰减分数：同一条消息在任何 session 状态下结果一致，
     # 不会把"你是谁""hi"这类新问题误判成 complex。
-    if state.last_turn_complex and (f["has_reference"] or _is_followup(message)):
+    # 簇G(2026-08-20): 假设追问也继承 complex——"那如果改成用Redis做缓存呢"
+    # 承接复杂会话时不再落灰区。仅上轮 complex 时生效, 反例验证不误伤。
+    if state.last_turn_complex and (
+            f["has_reference"] or _is_followup(message)
+            or _is_hypothetical(message)):
         return "complex", "r0_context"
     if not state.last_turn_complex and _is_continue(message):
         return "simple", "r0_continue"
