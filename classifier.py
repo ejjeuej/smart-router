@@ -456,10 +456,33 @@ _COMPLEX_SIGNALS = (
     "内存泄漏", "性能瓶颈", "限流", "熔断",
 )
 
+# 簇E(2026-08-20): 算法名词表 —— "用动态规划怎么解"等请求该升 complex。
+# 只放无歧义/低误伤词: "回溯法" 不放裸"回溯"(会误伤"回溯到上个版本");
+# 不放 trie/prim/lcs/lis 等易撞英文单词的缩写。
+_ALGO_NAMES = (
+    # 中文算法名
+    "动态规划", "回溯法", "分治", "贪心", "递归下降", "拓扑排序",
+    "最小生成树", "最长公共子序列", "最长递增子序列", "最长上升子序列",
+    "二分图", "八皇后", "背包问题", "最短路径", "快速排序", "归并排序",
+    "二分查找", "广度优先", "深度优先", "kmp算法", "kmp 算法",
+    # 英文/缩写（子串匹配，全小写后判断）
+    "dijkstra", "kmp", "bfs", "dfs", "floyd", "bellman-ford",
+    "kruskal", "manacher", "shortest path", "topological sort",
+    "binary search", "quicksort", "mergesort", "backtracking",
+    "greedy", "divide and conquer",
+)
+
+
+def _has_algo_name(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in _ALGO_NAMES)
+
 # 求知型词：信号词出现在"什么是X/解释X/区别"里时，是讲解需求而非实际任务。
 # 带这些词的请求走解释/类型权重流程（短句甚至直接 simple），不升 complex。
+# 含英文 explain——簇E 修复时发现 "explain why quicksort..." 被算法名硬判。
 _KNOWLEDGE_ASKS = (
     "什么是", "啥是", "是什么", "解释", "讲讲", "介绍一下", "科普", "区别",
+    "explain", "what is", "what's",
 )
 
 
@@ -506,6 +529,7 @@ def _route_with_branch(message: str, state: ConversationState):
       R21  long summary（簇C: 长文纯摘要 → simple，先于 r2_long_signal）
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
       R2c  complex signal（架构/分布式/死锁…，length>10 且非纯求知）
+      R2ca algo name（簇E: 算法名 → complex，豁免长度门槛）
       R2d  multi-question（≥3 问号且 len>40 → 分析型）
       R2.3 short confirm / greeting / thanks → simple
       R2.4 mech layer（机械词 → simple，不调 LLM）
@@ -582,10 +606,15 @@ def _route_with_branch(message: str, state: ConversationState):
     # R2c: 复杂度信号（架构/分布式/死锁/证明…）— 无代码但明显复杂。
     # 防误伤双闸：length>10（"架构""证明"两三字不升）+ 非纯求知
     # （"什么是微服务架构""解释一下"是讲解需求，不升，交给类型权重/灰区）。
-    if (_has_complex_signal(message)
-            and f["length"] > 10
-            and not _is_knowledge_ask(message)):
-        return "complex", "r2_complex_signal"
+    if _has_complex_signal(message):
+        if f["length"] > 10 and not _is_knowledge_ask(message):
+            return "complex", "r2_complex_signal"
+
+    # 簇E(2026-08-20): 算法名 → complex, 豁免 length>10 门槛。
+    # "回溯法解八皇后问题"(9字) 不再被长度门槛挡掉; 求知反例
+    # ("什么是动态规划" 命中"什么是") 仍被 _is_knowledge_ask 保护不升。
+    if _has_algo_name(message) and not _is_knowledge_ask(message):
+        return "complex", "r2c_algo"
 
     # R2d: 多问号密度（借鉴点 29 — ThinkGate questionMarks 特征）
     # ≥3 个问号且够长 → 连续追问/分析型请求（"如何做A？如何保证B？如何优化C？"）。
