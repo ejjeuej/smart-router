@@ -224,6 +224,8 @@ _MECH_SIMPLE = (
     "翻译", "译成", "英译中", "中译英", "英翻中", "中翻英",
     # 润色/校对/格式类
     "润色", "改错别字", "改病句", "校对", "格式化", "排版", "缩句", "扩写",
+    # 注释类(簇F 2026-08-20: 加注释是机械活; 详见 _MECH_CODE_OK 豁免)
+    "加注释", "写注释", "加个注释", "补注释",
     # 机械摘要（针对报错/日志，不含泛化"总结"）
     "总结报错", "总结错误", "总结日志", "summarize this error",
     # 简单查询
@@ -234,10 +236,29 @@ _MECH_SIMPLE = (
     "读一下文件", "读取文件", "打开文件",
 )
 
+# 簇F: 带 code 信号也放行的机械词（默认 R2.4 对 has_code 放行——
+# "翻译一下这段代码"可能是真翻译需求; 但"加注释"永远是机械活, 不随 code 变）。
+_MECH_CODE_OK = ("加注释", "写注释", "加个注释", "补注释")
+
 
 def _is_mech_simple(message: str) -> bool:
     m = message.lower()
     return any(w in m for w in _MECH_SIMPLE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 簇F(2026-08-20): 纯 import/声明行 —— 机械抄写, flash 能干, 不烧 complex 池
+# "import os, sys, re, json, time"(len=30>20 且 has_code) 被 R2 误升。
+# 正则要求整条消息每行都是 import/from 语句——"写个import解析器"
+# "import os 然后帮我看看" 这类任务句不匹配, 不会被误杀。
+# ═══════════════════════════════════════════════════════════════════════════
+_PURE_IMPORT_LINE = re.compile(
+    r"^(from [\w.]+ import [\w*,\s]+|import [\w.,\s]+)$")
+
+
+def _is_pure_import(message: str) -> bool:
+    lines = [ln.strip() for ln in message.splitlines() if ln.strip()]
+    return bool(lines) and all(_PURE_IMPORT_LINE.match(ln) for ln in lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -525,6 +546,7 @@ def _route_with_branch(message: str, state: ConversationState):
       R20  mech summary（簇B: 总结报错/概括日志 → simple，先于上下文继承与 code 信号）
       R0   context inheritance（上轮 complex + 跟帖 → complex；
                                 上轮 simple + 继续专属词 → simple）
+      R22  pure import（簇F: 整条消息仅 import/from 语句 → simple）
       R2   explicit complex（code/math/语言签名需 length>20）
       R21  long summary（簇C: 长文纯摘要 → simple，先于 r2_long_signal）
       R2b  long + weak signal（长且带特征才升，纯长粘贴不定级）
@@ -585,6 +607,11 @@ def _route_with_branch(message: str, state: ConversationState):
     if not state.last_turn_complex and _is_continue(message):
         return "simple", "r0_continue"
 
+    # 簇F(2026-08-20): 纯 import/声明行 → simple。整条消息只有 import/from
+    # 语句(可多行)——机械抄写, 不烧 complex 池。
+    if _is_pure_import(message):
+        return "simple", "r22_pure_import"
+
     # R2: explicit complex signals — no LLM needed
     # 借鉴点 1+B6: code/math 还需 length>20，防 "pip install"/"import os" 这类
     # 短代码也烧贵模型。
@@ -635,9 +662,12 @@ def _route_with_branch(message: str, state: ConversationState):
         return "simple", "r23_short"
 
     # R2.4: 机械层（借鉴点 21+27 — ThinkGate fastSignals）
-    # 明确机械活（翻译/润色/格式化/时间查询…）→ simple，不调 LLM。
-    # 带 code/math 信号时放过（可能是"翻译一下这段代码"）。
-    if _is_mech_simple(message) and not (f["has_code"] or f["has_math"]):
+    # 明确机械活（翻译/润色/格式化/加注释/时间查询…）→ simple，不调 LLM。
+    # 带 code/math 信号时放过（可能是"翻译一下这段代码"）；但"加注释"类
+    # (簇F) 永远是机械活, 即使带代码也放行。
+    if _is_mech_simple(message) and (
+            not (f["has_code"] or f["has_math"])
+            or any(w in message for w in _MECH_CODE_OK)):
         return "simple", "r24_mech"
 
     # R2.5: type not matched + non-trivial message → don't trust factual default
