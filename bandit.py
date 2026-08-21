@@ -48,7 +48,7 @@ W_C = 0.4              # 成本分量权重
 W_L = 0.3              # 延迟分量权重
 PEN_RATE_LIMIT = 0.3   # 429/5xx 软惩罚(借鉴点 50)
 PEN_QUOTA = 0.5        # 403/余额耗尽软惩罚
-LATENCY_MAX = 60000.0  # 延迟归一化封顶(ms,≈REQUEST_TIMEOUT, 20s→60s 同步 2026-08-20)
+LATENCY_MAX = 120000.0  # 延迟归一化封顶(ms,≈REQUEST_TIMEOUT, 60s→120s 同步 2026-08-21)
 
 # ── 成本 log 归一化(借鉴点 45)──
 C_FLOOR = 1e-4         # $/1k tokens 下限
@@ -340,7 +340,33 @@ class UCBBandit:
             self._mark_play(best["model"])
             return best
 
-        # 4. 硬上限剪枝(46)：超预算时排除最贵臂（电路断路器）
+        # 4-5. 剪枝 + UCB 打分排序（复用 rank，纯计算无副作用）
+        scored = self.rank(candidates, task_type=task_type, cheap=cheap)
+        if not scored:
+            return None
+
+        # 6. tie-breaker(54)：top-2 打分差 < ε → 选历史 Q 均值高者，防抖动
+        if len(scored) >= 2 and (scored[0][0] - scored[1][0]) < self.tie_eps:
+            pick = scored[0] if scored[0][1] >= scored[1][1] else scored[1]
+        else:
+            pick = scored[0]
+
+        self._mark_play(pick[3]["model"])
+        return pick[3]
+
+    def rank(self, candidates, task_type=None, cheap=False):
+        """对候选按 UCB score 降序打分排序（纯计算，无副作用）。
+
+        复用 select 的硬上限剪枝(46) + UCB 打分(40/41/45)逻辑，但不做全局
+        衰减、先验注入、burn-in 轮转、mark_play。返回
+        [(score, avg, cost_pen, c), ...]，score = avg + exploration − cost_pen
+        降序。供 select（取第一名）与 fallback（按 avg − cost_pen 遍历，
+        去掉探索项）共用。
+        """
+        if not candidates:
+            return []
+
+        # 硬上限剪枝(46)：超预算时排除最贵臂（电路断路器）
         active = list(candidates)
         if self.budget > 0 and self.lambda_t > 0:
             hard_cap = max(self.budget * HARD_CAP_MULT, 1e-6) / (1.0 + self.lambda_t)
@@ -348,7 +374,7 @@ class UCBBandit:
             if pruned:
                 active = pruned
 
-        # 5. UCB 选最优：effective_N = 当前候选模型 overall pulls 之和
+        # UCB 打分：effective_N = 当前候选模型 overall pulls 之和
         effective_N = sum(
             self.stats[c["model"]]["overall"]["pulls"]
             for c in active
@@ -356,6 +382,8 @@ class UCBBandit:
         )
         scored = []
         for c in active:
+            if c["model"] not in self.stats:
+                continue  # 防御：未注入先验的模型不参与排序
             avg, pulls = self._blended_stats(c["model"], task_type)
             pulls_safe = max(pulls, EPS)
 
@@ -371,29 +399,16 @@ class UCBBandit:
             # Budget Pacer 成本惩罚(40/45)：−(λc·mult + λt)·c̃
             cost_pen = 0.0
             if self.budget > 0 or self.lambda_c > 0:
-                # cheap 意图(借鉴点 32 落地)：临时抬高 λ_c，让"省钱"请求
-                # 在池内显著偏向便宜臂。只影响本轮打分，不落盘、不影响 λ_t。
-                # 注意：若 lambda_c=0（成本通道未启用），cheap 也无效。
                 lambda_c_eff = self.lambda_c * (
                     CHEAP_LAMBDA_MULT if cheap else 1.0)
                 cost_pen = (lambda_c_eff + self.lambda_t) * self._log_norm_cost(
                     self._est_cost(c["model"]))
 
             score = avg + exploration - cost_pen
-            scored.append((score, avg, c))
+            scored.append((score, avg, cost_pen, c))
 
-        if not scored:
-            return None
-
-        # 6. tie-breaker(54)：top-2 打分差 < ε → 选历史 Q 均值高者，防抖动
         scored.sort(key=lambda s: s[0], reverse=True)
-        if len(scored) >= 2 and (scored[0][0] - scored[1][0]) < self.tie_eps:
-            pick = scored[0] if scored[0][1] >= scored[1][1] else scored[1]
-        else:
-            pick = scored[0]
-
-        self._mark_play(pick[2]["model"])
-        return pick[2]
+        return scored
 
     # ── 更新 ────────────────────────────────────────────────────────
 

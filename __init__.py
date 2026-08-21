@@ -96,9 +96,9 @@ _PERMANENT_BROKEN_MARKERS = (
     "invalid_parameter",        # 400 code=invalid_parameter_error（enable_thinking / max_tokens 范围等）
 )
 
-REQUEST_TIMEOUT = 60.0  # 单次模型调用超时（秒），避免坏端点/长跑模型卡死
-                        # 20s→60s(2026-08-20): complex 池 qwen3.7-max/deepseek-v4
-                        # 开思考后 30s+ 被掐断, 端到端三轮复验每次都有 20s 超时
+REQUEST_TIMEOUT = 120.0  # 单次模型调用超时（秒），避免坏端点/长跑模型卡死
+                         # 60s→120s(2026-08-21): complex 池 qwen3.7-max 平均 79s>60s
+                         # 被掐断, 峰值 117s; 单独重测 complex 需放宽
 
 
 def _is_permanent_broken(err_str: str) -> bool:
@@ -606,14 +606,21 @@ def on_llm_execution(request, next_call, **context):
                                       total_tokens=0, task_type=task_type)
                         save_one(pool_key)
 
-    # ── 顺序 fallback：逐个尝试未试过的候选 ──
+    # ── 顺序 fallback：按 bandit 打分排名逐个尝试未试过的候选 ──
+    # bandit 已启用且 rank 可用时，按 (avg − cost_pen) 降序遍历（去掉探索项：
+    # fallback 阶段选"已知最稳"而非"继续探索"）；否则回退原始顺序。
     fallback_list = candidates
-    if use_bandit and result.get("cost_mode") == "cheap":
-        # cheap 意图：fallback 也按估计成本升序，先试便宜的（bandit 已
-        # 在 use_bandit 分支内创建，此处安全引用；未启用 bandit 时无价格
-        # 信号，保持原白名单顺序）。
-        fallback_list = sorted(candidates,
-                               key=lambda c: bandit._est_cost(c["model"]))
+    if use_bandit:
+        try:
+            ranked = bandit.rank(
+                candidates,
+                task_type=task_type,
+                cheap=result.get("cost_mode") == "cheap")
+            ranked.sort(key=lambda s: s[1] - s[2], reverse=True)
+            fallback_list = [c for (_, _, _, c) in ranked]
+        except Exception as e:
+            info(f"bandit rank failed, fallback to original order: {e}")
+            fallback_list = candidates
     for c in fallback_list:
         if _quota_cooling(c["model"]):
             info(f"skipping {c['model']} — quota exhausted (冷却期内)")
