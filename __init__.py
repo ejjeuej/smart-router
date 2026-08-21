@@ -1,4 +1,5 @@
 import atexit
+import json
 import os
 import sys
 import time
@@ -65,9 +66,42 @@ def _is_quota_exhausted(err_str: str) -> bool:
     return any(m in low for m in _QUOTA_MARKERS)
 
 
-# 进程级永久拉黑：这些错误意味着模型在本次进程内永远不可用
-# （404 未开通 / 400 不支持 tool call / 无访问权限），重启后重扫才可能恢复。
+# 进程级永久拉黑：这些错误意味着模型永久不可用
+# （404 未开通 / 400 不支持 tool call / 无访问权限）。
+# 2026-08-21 起持久化到 data/blacklist.json，重启后仍生效，
+# 避免垃圾模型每次重启都重新进池、第一次调用才重新拉黑。
 _PERMANENT_BLACKLIST = set()
+_BLACKLIST_PATH = _plugin_dir / "data" / "blacklist.json"
+
+
+def _load_blacklist() -> None:
+    """启动时加载持久化黑名单，重启后垃圾模型仍被过滤。"""
+    try:
+        if _BLACKLIST_PATH.exists():
+            data = json.loads(_BLACKLIST_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                _PERMANENT_BLACKLIST.update(
+                    m for m in data if isinstance(m, str))
+    except Exception:
+        pass
+
+
+def _save_blacklist() -> None:
+    """把当前黑名单落盘（幂等，失败静默）。"""
+    try:
+        _BLACKLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _BLACKLIST_PATH.write_text(
+            json.dumps(sorted(_PERMANENT_BLACKLIST), ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _blacklist_add(model: str) -> None:
+    """拉黑一个模型并落盘（去重，幂等）。"""
+    if model and model not in _PERMANENT_BLACKLIST:
+        _PERMANENT_BLACKLIST.add(model)
+        _save_blacklist()
 
 # 额度耗尽冷却：403/quota 耗尽属于临时状态（充钱后恢复），
 # 记录最近一次 403 的时间戳，冷却期内跳过该模型（不白等超时），
@@ -108,6 +142,7 @@ def _is_permanent_broken(err_str: str) -> bool:
 
 
 def register(ctx):
+    _load_blacklist()
     ctx.register_middleware("llm_execution", on_llm_execution)
     atexit.register(_save_bandits_on_exit)
 
@@ -194,7 +229,7 @@ def _fallback_route(request, next_call, cfg):
             if _is_quota_exhausted(err_str):
                 _EXHAUSTED_COOLDOWN[c["model"]] = time.time()
             elif _is_permanent_broken(err_str):
-                _PERMANENT_BLACKLIST.add(c["model"])
+                _blacklist_add(c["model"])
                 info(f"{c['model']} permanently broken (fallback), "
                       f"blacklisted")
             continue
@@ -589,7 +624,7 @@ def on_llm_execution(request, next_call, **context):
                               f"{selected['model']}, down-ranked (冷却期内跳过，"
                               f"{_EXHAUSTED_COOLDOWN_SEC}s 后自动重试)")
                     elif _is_permanent_broken(err_str):
-                        _PERMANENT_BLACKLIST.add(selected["model"])
+                        _blacklist_add(selected["model"])
                         info(f"{selected['model']} permanently "
                               f"broken (404/400/access denied), blacklisted")
                     elif any(s in err_str for s in
@@ -696,7 +731,7 @@ def on_llm_execution(request, next_call, **context):
                       f"down-ranked (冷却期内跳过，"
                       f"{_EXHAUSTED_COOLDOWN_SEC}s 后自动重试)")
             elif _is_permanent_broken(err_str):
-                _PERMANENT_BLACKLIST.add(c["model"])
+                _blacklist_add(c["model"])
                 info(f"{c['model']} permanently broken "
                       f"(404/400/access denied), blacklisted")
             elif any(s in err_str for s in
