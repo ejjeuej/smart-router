@@ -70,7 +70,7 @@ STALE_GROWTH = 1.15    # 每闲置一轮探索 bonus 膨胀系数
 STALE_MAX = 14.0       # 封顶倍数(≈√Vmax, 防无限膨胀吞掉成本惩罚)
 
 # ── burn-in(借鉴点 43)──
-BURN_IN_PULLS = 20     # 新臂强制探索次数(离线预热注入后视为已完成)
+BURN_IN_PULLS = 10     # 新臂强制探索次数(离线预热注入后视为已完成; 2026-08-21 由 20 调低, 加速 UCB 打分启用)
 
 # ── margin tie-breaker(借鉴点 54)──
 TIE_EPS = 0.02         # top-2 打分差阈值
