@@ -69,6 +69,20 @@ def _is_quota_exhausted(err_str: str) -> bool:
 # （404 未开通 / 400 不支持 tool call / 无访问权限），重启后重扫才可能恢复。
 _PERMANENT_BLACKLIST = set()
 
+# 额度耗尽冷却：403/quota 耗尽属于临时状态（充钱后恢复），
+# 记录最近一次 403 的时间戳，冷却期内跳过该模型（不白等超时），
+# 冷却期结束自动放出来重试（不永久拉黑）。
+_EXHAUSTED_COOLDOWN: dict = {}   # model -> 最近一次 403 的 epoch 秒
+_EXHAUSTED_COOLDOWN_SEC = 300    # 冷却期 5 分钟
+
+
+def _quota_cooling(model: str) -> bool:
+    """返回 True 表示该模型正处于额度耗尽冷却期，本轮应跳过。"""
+    ts = _EXHAUSTED_COOLDOWN.get(model)
+    if ts is None:
+        return False
+    return (time.time() - ts) < _EXHAUSTED_COOLDOWN_SEC
+
 _PERMANENT_BROKEN_MARKERS = (
     "access_denied",            # 403 无权限（非额度问题）
     "access denied",
@@ -423,7 +437,7 @@ def on_llm_execution(request, next_call, **context):
     bandit_cfg = cfg.get("bandit", {})
     use_bandit = bandit_cfg.get("enabled", False)
 
-    exhausted_models = set()   # 额度耗尽，仅本次请求拉黑（函数每次调用重建）
+    # 额度耗尽冷却用模块级 _EXHAUSTED_COOLDOWN（跨请求生效，5 分钟自动恢复）
     round_blacklist = set()    # 临时故障，仅本轮拉黑
     tried_models = set()
 
@@ -433,7 +447,7 @@ def on_llm_execution(request, next_call, **context):
         bandit = get_bandit(pool_key, bandit_cfg)
 
         active = [c for c in candidates
-                  if c["model"] not in exhausted_models
+                  if not _quota_cooling(c["model"])
                   and c["model"] not in round_blacklist]
         if active:
             # 借鉴点 32 接线：用户明说"省钱/随便/便宜点" →
@@ -503,13 +517,14 @@ def on_llm_execution(request, next_call, **context):
                     info(f"bandit {selected['model']} failed: {e}")
 
                     if _is_quota_exhausted(err_str):
-                        exhausted_models.add(selected["model"])
+                        _EXHAUSTED_COOLDOWN[selected["model"]] = time.time()
                         bandit.update(selected["model"], success=False,
                                       total_tokens=0, task_type=task_type,
                                       penalty=0.5)  # 借鉴点50: 软惩罚, 恢复后回血
+                        save_one(pool_key)   # 惩罚落盘，重启不丢，随衰减自动恢复
                         info(f"quota exhausted for "
-                              f"{selected['model']}, down-ranked (本轮跳过，"
-                              f"后续轮次/下次额度恢复会重试)")
+                              f"{selected['model']}, down-ranked (冷却期内跳过，"
+                              f"{_EXHAUSTED_COOLDOWN_SEC}s 后自动重试)")
                     elif _is_permanent_broken(err_str):
                         _PERMANENT_BLACKLIST.add(selected["model"])
                         info(f"{selected['model']} permanently "
@@ -520,6 +535,7 @@ def on_llm_execution(request, next_call, **context):
                         bandit.update(selected["model"], success=False,
                                       total_tokens=0, task_type=task_type,
                                       penalty=0.3)  # 借鉴点50: 故障期降权, 可自动恢复
+                        save_one(pool_key)   # 惩罚落盘，重启不丢
                         info(f"server error for "
                               f"{selected['model']}, skipping this round")
                     else:
@@ -536,8 +552,8 @@ def on_llm_execution(request, next_call, **context):
         fallback_list = sorted(candidates,
                                key=lambda c: bandit._est_cost(c["model"]))
     for c in fallback_list:
-        if c["model"] in exhausted_models:
-            info(f"skipping {c['model']} — quota exhausted")
+        if _quota_cooling(c["model"]):
+            info(f"skipping {c['model']} — quota exhausted (冷却期内)")
             continue
         if c["model"] in round_blacklist:
             info(f"skipping {c['model']} — server error this round")
@@ -601,12 +617,14 @@ def on_llm_execution(request, next_call, **context):
             info(f"{c['model']} failed: {e}")
 
             if _is_quota_exhausted(err_str):
-                exhausted_models.add(c["model"])
+                _EXHAUSTED_COOLDOWN[c["model"]] = time.time()
                 if use_bandit:
                     bandit.update(c["model"], success=False, total_tokens=0,
                                   task_type=task_type, penalty=0.5)  # 借鉴点50
+                    save_one(pool_key)   # 惩罚落盘，重启不丢
                 info(f"quota exhausted for {c['model']}, "
-                      f"down-ranked (本轮跳过，后续轮次/下次额度恢复会重试)")
+                      f"down-ranked (冷却期内跳过，"
+                      f"{_EXHAUSTED_COOLDOWN_SEC}s 后自动重试)")
             elif _is_permanent_broken(err_str):
                 _PERMANENT_BLACKLIST.add(c["model"])
                 info(f"{c['model']} permanently broken "
@@ -617,6 +635,7 @@ def on_llm_execution(request, next_call, **context):
                 if use_bandit:
                     bandit.update(c["model"], success=False, total_tokens=0,
                                   task_type=task_type, penalty=0.3)  # 借鉴点50
+                    save_one(pool_key)   # 惩罚落盘，重启不丢
                 info(f"server error for {c['model']}, "
                       f"skipping this round")
             else:
