@@ -86,6 +86,7 @@ def _quota_cooling(model: str) -> bool:
 _PERMANENT_BROKEN_MARKERS = (
     "access_denied",            # 403 无权限（非额度问题）
     "access denied",
+    "accessdenied",             # 百炼驼峰 code AccessDenied.Unpurchased（未购买）
     "modelnotopen",             # Ark 模型未开通
     "notfound",                 # InvalidEndpointOrModel.NotFound
     "not found",
@@ -137,6 +138,68 @@ def _safe_pass_through(request, next_call):
               f"{request.get('model')} → {default_model}")
         return next_call(fallback_request)
     return next_call(request)
+
+
+def _fallback_route(request, next_call, cfg):
+    """白名单兜底直连：主路径/续调没接住时的正确退路。
+
+    逐个尝试白名单候选（simple 池优先、complex 池兜底），成功则记
+    _last_routed 并返回；全部失败才透传给 Hermes 默认模型。这样用户
+    把默认模型配错/未开通时，插件仍退回白名单，而不是退回那个会 403
+    的默认模型。
+    """
+    global _last_routed
+    candidates = []
+    for pool_key in ("simple_models", "complex_models"):
+        for model_name in cfg.get(pool_key, []):
+            if model_name in _PERMANENT_BLACKLIST or _quota_cooling(model_name):
+                continue
+            for entry in _normalize_provider_list(
+                    cfg.get("providers", {}).get(model_name)):
+                api_key = _resolve_entry_key(entry)
+                if api_key and entry.get("base_url"):
+                    candidates.append({
+                        "model": model_name,
+                        "base_url": entry["base_url"],
+                        "api_key": api_key,
+                        "pool_key": pool_key,
+                    })
+                    break
+
+    for c in candidates:
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url=c["base_url"], api_key=c["api_key"],
+                            timeout=REQUEST_TIMEOUT)
+            modified = dict(request)
+            modified["model"] = c["model"]
+            modified.pop("stream", None)
+            modified.pop("stream_options", None)
+            modified = _ensure_thinking(modified, c["model"], c["base_url"])
+            info(f"fallback-route → {c['model']}")
+            _t_call = time.monotonic()
+            response = client.chat.completions.create(**modified)
+            _latency_call_ms = int((time.monotonic() - _t_call) * 1000)
+
+            _last_routed = {"model": c["model"],
+                            "base_url": c["base_url"],
+                            "api_key": c["api_key"],
+                            "pool_key": c["pool_key"]}
+            return _annotate_response(response, cfg, c["model"], "?", "?",
+                                      "fallback", _latency_call_ms,
+                                      c["pool_key"])
+        except Exception as e:
+            err_str = str(e)
+            info(f"fallback-route {c['model']} failed: {e}")
+            if _is_quota_exhausted(err_str):
+                _EXHAUSTED_COOLDOWN[c["model"]] = time.time()
+            elif _is_permanent_broken(err_str):
+                _PERMANENT_BLACKLIST.add(c["model"])
+                info(f"{c['model']} permanently broken (fallback), "
+                      f"blacklisted")
+            continue
+
+    return _safe_pass_through(request, next_call)
 
 
 def _annotate_response(response, cfg, model_routed, complexity, task_type,
@@ -329,9 +392,9 @@ def on_llm_execution(request, next_call, **context):
                     _last_routed.get("method", "?"),
                     _latency_call_ms,
                     _last_routed.get("pool_key", "simple_models"))
-            except Exception:
-                pass
-        return _safe_pass_through(request, next_call)
+            except Exception as e:
+                error(f"tool continue failed, trying whitelist fallback: {e}")
+        return _fallback_route(request, next_call, cfg)
 
     # ── 构建分类器配置：轻量模型优先，复杂模型兜底，组成 fallback 链 ──
     classifier_cfg = []
@@ -431,7 +494,7 @@ def on_llm_execution(request, next_call, **context):
             })
 
     if not candidates:
-        return _safe_pass_through(request, next_call)
+        return _fallback_route(request, next_call, cfg)
 
     # ── Phase 2: UCB 老虎机选模型（若启用）──
     bandit_cfg = cfg.get("bandit", {})
